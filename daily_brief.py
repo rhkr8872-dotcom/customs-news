@@ -3,16 +3,21 @@
 Samsung Electronics | Customs & Trade Daily Brief
 E2E: Sensor + Outputs + Mail (Practitioner + Executive)
 
-- Google News RSS 기반 센서 (PC 없이 GitHub Actions에서 구동)
-- out/에 CSV/XLSX/HTML 저장
-- 실무자용 메일 + 임원용 TOP3 메일 분리
-- 정책성 점수(리스크 스코어) 고도화
+✅ Google News RSS 기반 센서 (PC 없이 GitHub Actions에서 구동)
+✅ 수집 기간: 전날 07:00(KST) ~ 당일 07:00(KST)
+✅ 메일 발송: 08:00(KST) (GitHub Actions cron은 별도 설정)
+✅ out/에 CSV/XLSX/HTML 저장
+✅ 실무자용 메일(표 중심) + 임원용 TOP3(Trigger/Exposure/Action 포함) 분리
+✅ 제목=요약 중복 완화 + 정책성 점수(리스크 스코어) 고도화
 """
 
 # ===============================
 # IMPORT
 # ===============================
-import os, re, html, smtplib
+import os
+import re
+import html
+import smtplib
 import datetime as dt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -35,22 +40,59 @@ RECIPIENTS_EXEC = [x.strip() for x in os.getenv("RECIPIENTS_EXEC", "").split(","
 BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(__file__), "out"))
 os.makedirs(BASE_DIR, exist_ok=True)
 
+NEWS_QUERY = os.getenv("NEWS_QUERY", "관세")
+NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "50"))  # 시간 필터 때문에 여유롭게 50개 권장
+
 # ===============================
 # TIME
 # ===============================
 def now_kst():
     return dt.datetime.utcnow() + dt.timedelta(hours=9)
 
+def window_kst_07_to_07():
+    """
+    수집기간: 전날 07:00(KST) ~ 당일 07:00(KST)
+    """
+    now = now_kst()
+    end = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    # end는 "가장 최근의 07:00"
+    if now < end:
+        end = end  # 오늘 07:00
+    else:
+        end = end  # 오늘 07:00
+    start = end - dt.timedelta(days=1)
+    return start, end
+
+def parse_published_to_kst(entry) -> dt.datetime | None:
+    """
+    feedparser entry의 published_parsed(struct_time)를 우선 사용.
+    없거나 파싱 실패하면 None (추정 금지)
+    """
+    try:
+        tp = getattr(entry, "published_parsed", None)
+        if tp:
+            utc_dt = dt.datetime(*tp[:6])  # 보통 UTC로 들어옴
+            return utc_dt + dt.timedelta(hours=9)  # KST
+    except Exception:
+        pass
+    return None
+
 # ===============================
-# POLICY SCORE (3) 고도화
+# POLICY SCORE (고도화)
 # ===============================
 RISK_RULES = [
+    ("tariff act", 8),
+    ("trade expansion act", 8),
+    ("international emergency economic powers act", 8),
+    ("ieepa", 8),
+
     ("section 301", 6),
     ("section 232", 6),
-    ("ieepa", 6),
+
     ("export control", 6),
     ("sanction", 6),
     ("entity list", 5),
+
     ("anti-dumping", 5),
     ("countervailing", 5),
     ("safeguard", 5),
@@ -58,11 +100,12 @@ RISK_RULES = [
     ("tariff", 4),
     ("duty", 4),
     ("관세", 4),
-    ("관세율", 4),
-    ("추가관세", 4),
+    ("관세율", 5),
+    ("추가관세", 5),
 
-    ("hs code", 3),
+    ("hs code", 4),
     ("hs", 3),
+
     ("원산지", 3),
     ("fta", 3),
     ("customs", 3),
@@ -82,12 +125,20 @@ def calc_policy_score(title: str, summary: str) -> int:
             score += w
     return min(score, 20)
 
+def score_to_importance(score: int) -> str:
+    # 상: 관세율/HS/법령급 트리거 가능성이 높은 점수대
+    if score >= 13:
+        return "상"
+    if score >= 7:
+        return "중"
+    return "하"
+
 # ===============================
-# COUNTRY TAG (2에서 만든 기능 유지)
+# COUNTRY TAG
 # ===============================
 COUNTRY_KEYWORDS = {
-    "USA": ["u.s.", "united states", "america", "section 301", "section 232"],
-    "India": ["india"],
+    "USA": ["u.s.", "united states", "america", "ustr", "section 301", "section 232", "commerce department", "bis"],
+    "India": ["india", "cbic", "dgft"],
     "Türkiye": ["turkey", "türkiye"],
     "Vietnam": ["vietnam"],
     "Netherlands": ["netherlands", "dutch"],
@@ -95,6 +146,8 @@ COUNTRY_KEYWORDS = {
     "China": ["china"],
     "Mexico": ["mexico"],
     "Brazil": ["brazil"],
+    "Indonesia": ["indonesia"],
+    "Korea": ["korea", "korean", "south korea", "republic of korea"],
 }
 
 def detect_country(text: str) -> str:
@@ -105,48 +158,177 @@ def detect_country(text: str) -> str:
     return ""
 
 # ===============================
-# SENSOR (완전 자동)
+# TRIGGER / EXPOSURE / ACTION (EXEC)
 # ===============================
+def infer_trigger(text: str) -> str:
+    t = (text or "").lower()
+    if "international emergency economic powers act" in t or "ieepa" in t:
+        return "IEEPA(국제비상경제권한법)"
+    if "trade expansion act" in t or "section 232" in t:
+        return "Trade Expansion Act / Section 232"
+    if "section 301" in t:
+        return "Section 301(무역법)"
+    if "tariff act" in t:
+        return "Tariff Act(관세법 체계)"
+    if "hs" in t or "hs code" in t:
+        return "HS/품목 분류"
+    if "tariff" in t or "관세율" in t or "추가관세" in t or "duty" in t:
+        return "관세율/추가관세"
+    if "export control" in t or "entity list" in t:
+        return "수출통제/제재"
+    if "anti-dumping" in t or "countervailing" in t or "safeguard" in t:
+        return "무역구제(AD/CVD/SG)"
+    if "fta" in t or "원산지" in t:
+        return "FTA/원산지"
+    return "통상 정책"
+
+def infer_exposure(country: str) -> str:
+    c = (country or "").strip()
+    if c == "USA":
+        return "미국 판매/수입 + 제3국 생산(VN/IN/MX) 노출 우선 점검"
+    if c == "India":
+        return "인도 생산/판매 영향 + HS/관세율 변동 여부 우선 점검"
+    if c in ["Vietnam", "Mexico", "Brazil", "Türkiye", "China", "EU", "Indonesia", "Korea", "Netherlands"]:
+        return f"{c} 관련 생산/수출입 및 규정 변화 여부 우선 점검"
+    return "주요 생산법인(상위 3개) 우선 스크리닝 후 판매법인 확장"
+
+def build_action_48h(trigger: str, country: str) -> str:
+    # HTML로 바로 넣기 위해 <br/> 사용
+    return (
+        "1) 적용 시점/대상국/대상품목(HS) 확인<br/>"
+        "2) 생산→판매 법인 순서로 원가/마진/리드타임 1차 산정<br/>"
+        "3) 필요 시 HS/원산지/가격(계약조건) 시나리오 점검 및 HQ 대응 착수"
+    )
+
+# ===============================
+# TOP3 POLICY FILTER
+# ===============================
+ALLOW = [
+    "관세", "tariff", "관세율", "hs", "hs code",
+    "section 232", "trade expansion act",
+    "section 301",
+    "ieepa", "international emergency economic powers act",
+    "tariff act",
+    "fta", "원산지",
+    "무역구제", "anti-dumping", "countervailing", "safeguard",
+    "수출통제", "export control",
+    "sanction", "entity list",
+    "통관", "customs",
+    "duties", "duty"
+]
+BLOCK = [
+    "시위", "protest", "체포", "arrest", "충돌", "violent",
+    "immigration", "ice raid", "연방정부", "주정부"
+]
+
+def is_trade_policy_related(title: str, summary: str) -> bool:
+    blob = f"{title} {summary}".lower()
+    if any(b in blob for b in BLOCK):
+        return False
+    return any(a in blob for a in ALLOW)
+
+def is_valid_top3(r):
+    blob = f"{r.get('헤드라인','')} {r.get('주요내용','')}".lower()
+    if any(b in blob for b in BLOCK):
+        return False
+    return any(a in blob for a in ALLOW)
+
+# ===============================
+# SENSOR (완전 자동 / 07~07 필터 적용)
+# ===============================
+def clean_summary(title: str, summary: str) -> str:
+    """
+    RSS 특성상 summary가 title과 같거나 title을 포함하는 경우가 많아 중복을 완화.
+    """
+    t = (title or "").strip()
+    s = (summary or "").strip()
+
+    if not s:
+        return ""
+
+    # HTML 태그 제거
+    s = re.sub(r"<[^>]+>", "", s).strip()
+
+    # title이 summary에 포함되면 제거 시도
+    if s == t:
+        return ""
+    if t and t in s:
+        s2 = re.sub(re.escape(t), "", s).strip(" -–—|:·\t")
+        # 너무 짧아지면 원문 유지
+        if len(s2) >= 20:
+            return s2
+
+    return s
+
 def run_sensor_build_df() -> pd.DataFrame:
     """
-    Google News RSS 기반 '관세' 관련 뉴스 수집 → DF 생성
+    Google News RSS 기반 NEWS_QUERY 관련 뉴스 수집 → DF 생성
+    수집기간: 전날 07:00(KST) ~ 당일 07:00(KST)
     """
-    query = os.getenv("NEWS_QUERY", "관세")
-
     rss = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
-        "q": query,
+        "q": NEWS_QUERY,
         "hl": "ko",
         "gl": "KR",
         "ceid": "KR:ko"
     })
 
     feed = feedparser.parse(rss)
+    start, end = window_kst_07_to_07()
 
     rows = []
-    for e in feed.entries[:30]:
+    for e in feed.entries[:NEWS_LIMIT]:
         title = getattr(e, "title", "").strip()
         link = getattr(e, "link", "").strip()
-        published = getattr(e, "published", "")
 
-        summary = getattr(e, "summary", "")
-        summary = re.sub(r"<[^>]+>", "", summary).strip()
+        # 출처 불명확하면 제외
+        if not link:
+            continue
+
+        published_kst = parse_published_to_kst(e)
+        # 추정 금지: 발표일 없으면 제외(원하시면 빈칸으로 포함 가능)
+        if published_kst is None:
+            continue
+
+        # 07~07 범위 필터
+        if not (start <= published_kst < end):
+            continue
+
+        summary_raw = getattr(e, "summary", "") or ""
+        summary = clean_summary(title, summary_raw)
+
+        # 정책 관련성 낮으면 제외(요구사항: 관련 없는 정보 출력 금지)
+        if not is_trade_policy_related(title, summary):
+            continue
+
+        # 요약이 너무 빈약하면 최소 문구(원하시면 빈칸으로 바꿔도 됨)
+        if not summary:
+            summary = "요약정보 부족(원문 링크 확인 필요)"
 
         country = detect_country(f"{title} {summary}")
         score = calc_policy_score(title, summary)
+        importance = score_to_importance(score)
 
         rows.append({
-            "제시어": query,
+            "제시어": NEWS_QUERY,
             "헤드라인": title,
             "주요내용": summary[:500],
+            "발표일": published_kst.strftime("%Y-%m-%d %H:%M"),
             "대상 국가": country,
-            "중요도": "중",
-            "발표일": published,
+            "관련 기관": "",  # RSS만으로는 정확한 기관 식별이 어려워 빈칸(추정 금지)
             "출처(URL)": link,
+            "중요도": importance,
+            "비고": "",
             "근거건수": 1,
             "점수": score,
         })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    # 중복 제거(헤드라인+링크 기준)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["헤드라인", "출처(URL)"], keep="first")
+
+    return df
 
 # ===============================
 # LOAD EVENTS (기존 파일 있으면 활용)
@@ -154,7 +336,6 @@ def run_sensor_build_df() -> pd.DataFrame:
 def load_events():
     today = now_kst().strftime("%Y-%m-%d")
     path = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
-
     if os.path.exists(path):
         return pd.read_csv(path)
 
@@ -169,24 +350,31 @@ def load_events():
     return pd.read_csv(path)
 
 # ===============================
-# SAFE COLUMNS
+# SAFE COLUMNS / ORDER
 # ===============================
+OUT_COLS = [
+    "주요내용", "발표일", "대상 국가", "관련 기관", "출처(URL)", "중요도", "비고",
+    "제시어", "헤드라인", "근거건수", "점수"
+]
+
 def ensure_cols(df):
     df = df.copy()
 
-    # 점수는 센서에서 만들면 유지, 없으면 기본 매핑
     if "점수" not in df.columns:
-        score_map = {"상": 9, "중": 6, "하": 3}
-        df["점수"] = df.get("중요도", "하").map(score_map).fillna(1)
+        df["점수"] = 1
+    if "중요도" not in df.columns:
+        df["중요도"] = df["점수"].apply(score_to_importance)
 
-    if "제시어" not in df.columns:
-        for c in ["policy_keyword", "keyword", "카테고리", "분류"]:
-            if c in df.columns:
-                df["제시어"] = df[c]
-                break
-        else:
-            df["제시어"] = "관세"
+    for c in ["관련 기관", "비고", "근거건수", "제시어", "헤드라인", "주요내용", "발표일", "대상 국가", "출처(URL)"]:
+        if c not in df.columns:
+            df[c] = ""
 
+    # 출력 컬럼 정렬
+    for c in OUT_COLS:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[OUT_COLS]
     return df
 
 # ===============================
@@ -194,27 +382,9 @@ def ensure_cols(df):
 # ===============================
 def get_link(r):
     for c in ["출처(URL)", "URL", "link", "원본링크", "originallink"]:
-        if c in r and pd.notna(r[c]):
-            return r[c]
+        if c in r and pd.notna(r[c]) and str(r[c]).strip():
+            return str(r[c]).strip()
     return "#"
-
-# ===============================
-# TOP3 POLICY FILTER
-# ===============================
-ALLOW = [
-    "관세","tariff","관세율","hs","section 232","section 301","ieepa",
-    "fta","원산지","무역구제","수출통제","export control","sanction","통관","customs"
-]
-BLOCK = [
-    "시위","protest","체포","arrest","충돌","violent",
-    "immigration","ice raid","연방정부","주정부"
-]
-
-def is_valid_top3(r):
-    blob = f"{r.get('헤드라인','')} {r.get('주요내용','')}".lower()
-    if any(b in blob for b in BLOCK):
-        return False
-    return any(a in blob for a in ALLOW)
 
 # ===============================
 # HTML STYLE
@@ -230,54 +400,45 @@ table{border-collapse:collapse;width:100%;}
 th,td{border:1px solid #ccc;padding:8px;font-size:12px;vertical-align:top;}
 th{background:#f0f0f0;}
 .small{font-size:11px;color:#555;}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #ddd;margin-right:6px;}
 </style>
 """
 
 # ===============================
-# HTML BUILD (실무자용)
+# HTML BUILD (실무자용: 표 중심)
 # ===============================
-def build_html(df):
+def build_html_practitioner(df):
     date = now_kst().strftime("%Y-%m-%d")
+    start, end = window_kst_07_to_07()
 
-    cand = df[df.apply(is_valid_top3, axis=1)]
-    top3 = cand.sort_values("점수", ascending=False).head(3)
+    # TOP3
+    cand = df[df.apply(is_valid_top3, axis=1)] if not df.empty else df
+    top3 = cand.sort_values("점수", ascending=False).head(3) if not cand.empty else df.head(3)
 
     top3_html = ""
     for _, r in top3.iterrows():
         top3_html += f"""
         <li>
-          <b>[{r['제시어']}｜{r.get('대상 국가','')}｜점수 {r['점수']}]</b><br/>
-          <a href="{get_link(r)}" target="_blank">{html.escape(str(r['헤드라인']))}</a><br/>
+          <span class="badge">중요도 {html.escape(str(r.get('중요도','')))}</span>
+          <span class="badge">점수 {html.escape(str(r.get('점수','')))}</span>
+          <b>[{html.escape(str(r.get('대상 국가','') or 'N/A'))}]</b><br/>
+          <a href="{get_link(r)}" target="_blank">{html.escape(str(r.get('헤드라인','')))}</a><br/>
           <div class="small">{html.escape(str(r.get('주요내용',''))[:260])}</div>
         </li>
         """
 
-    why_html = ""
-    for _, r in top3.iterrows():
-        why_html += f"<li>[{r['제시어']} | 근거 {r.get('근거건수',1)}건] 정책 변화 가능성으로 원가·마진·리드타임 영향</li>"
-
-    chk_html = ""
-    for _, r in top3.iterrows():
-        chk_html += f"""
-        <li>
-        [{r['제시어']}｜{r.get('대상 국가','')}｜점수 {r['점수']}]
-        영향: 정책 변화 가능성으로 원가·마진·리드타임 영향 →
-        조치: 1) HS/대상국 확인 → 2) 법인 영향 산정 → 3) 체크리스트 업데이트
-        </li>
-        """
-
+    # 표 rows
     rows = ""
     for _, r in df.iterrows():
         rows += f"""
         <tr>
-          <td>{r.get('제시어','')} ({r.get('중요도','')})</td>
-          <td>
-            <a href="{get_link(r)}" target="_blank">{html.escape(str(r.get('헤드라인','')))}</a><br/>
-            {html.escape(str(r.get('주요내용','')))}
-          </td>
-          <td>{r.get('발표일','')}</td>
-          <td>{r.get('대상 국가','')}</td>
-          <td>점수 {r.get('점수','')}</td>
+          <td>{html.escape(str(r.get('주요내용',''))[:400])}</td>
+          <td>{html.escape(str(r.get('발표일','')))}</td>
+          <td>{html.escape(str(r.get('대상 국가','')))}</td>
+          <td>{html.escape(str(r.get('관련 기관','')))}</td>
+          <td><a href="{get_link(r)}" target="_blank">Link</a></td>
+          <td>{html.escape(str(r.get('중요도','')))}</td>
+          <td>{html.escape(str(r.get('비고','')))}</td>
         </tr>
         """
 
@@ -286,31 +447,24 @@ def build_html(df):
     <head>{STYLE}</head>
     <body>
     <div class="page">
-      <h2>관세·무역 뉴스 브리핑 ({date})</h2>
+      <h2>관세·통상 데일리 브리프 ({date})</h2>
+      <div class="small">수집기간: {start.strftime("%Y-%m-%d %H:%M")} ~ {end.strftime("%Y-%m-%d %H:%M")} (KST)</div>
 
       <div class="box">
-        <h3>① 오늘의 핵심 정책 이벤트 TOP3</h3>
+        <h3>① 오늘의 핵심 TOP3</h3>
         <ul>{top3_html}</ul>
       </div>
 
       <div class="box">
-        <h3>② 왜 중요한가</h3>
-        <ul>{why_html}</ul>
-      </div>
-
-      <div class="box">
-        <h3>③ 당사 관점 체크포인트</h3>
-        <ul>{chk_html}</ul>
-      </div>
-
-      <div class="box">
-        <h3>📊 정책 센서 전용 표</h3>
+        <h3>② 정책 센서 표 (실무자용)</h3>
         <table>
           <tr>
-            <th>제시어(중요도)</th>
-            <th>헤드라인 / 주요내용</th>
+            <th>주요내용</th>
             <th>발표일</th>
-            <th>국가</th>
+            <th>대상 국가</th>
+            <th>관련 기관</th>
+            <th>출처(URL)</th>
+            <th>중요도</th>
             <th>비고</th>
           </tr>
           {rows}
@@ -322,20 +476,37 @@ def build_html(df):
     """
 
 # ===============================
-# HTML BUILD (임원용)
+# HTML BUILD (임원용: 의사결정형)
 # ===============================
 def build_html_exec(df):
     date = now_kst().strftime("%Y-%m-%d")
-    cand = df[df.apply(is_valid_top3, axis=1)]
-    top3 = cand.sort_values("점수", ascending=False).head(3)
+    start, end = window_kst_07_to_07()
+
+    cand = df[df.apply(is_valid_top3, axis=1)] if not df.empty else df
+    top3 = cand.sort_values("점수", ascending=False).head(3) if not cand.empty else df.sort_values("점수", ascending=False).head(3)
 
     items = ""
     for _, r in top3.iterrows():
+        headline = str(r.get("헤드라인",""))
+        summary = str(r.get("주요내용",""))
+        country = str(r.get("대상 국가","") or "")
+
+        trigger = infer_trigger(headline + " " + summary)
+        exposure = infer_exposure(country)
+        action = build_action_48h(trigger, country)
+
         items += f"""
-        <li>
-          <b>[{r.get('대상 국가','')} | 점수 {r.get('점수','')}]</b><br/>
-          <a href="{get_link(r)}" target="_blank">{html.escape(str(r.get('헤드라인','')))}</a><br/>
-          <div class="small">{html.escape(str(r.get('주요내용',''))[:220])}</div>
+        <li style="margin-bottom:18px;">
+          <span class="badge">중요도 {html.escape(str(r.get('중요도','')))}</span>
+          <span class="badge">점수 {html.escape(str(r.get('점수','')))}</span>
+          <b>[{html.escape(country or 'N/A')}]</b><br/>
+          <a href="{get_link(r)}" target="_blank">{html.escape(headline)}</a><br/>
+          <div class="small">{html.escape(summary[:240])}</div>
+          <div style="margin-top:8px;font-size:12px;">
+            <b>Trigger:</b> {html.escape(trigger)}<br/>
+            <b>Exposure:</b> {html.escape(exposure)}<br/>
+            <b>Action(48h):</b><br/>{action}
+          </div>
         </li>
         """
 
@@ -344,12 +515,17 @@ def build_html_exec(df):
     <body>
       <div class="page">
         <h2>[Executive] 관세·통상 핵심 TOP3 ({date})</h2>
+        <div class="small">수집기간: {start.strftime("%Y-%m-%d %H:%M")} ~ {end.strftime("%Y-%m-%d %H:%M")} (KST)</div>
+
         <div class="box">
           <ul>{items}</ul>
         </div>
-        <div class="box">
-          <b>Action</b><br/>
-          1) 대상국/품목(HS) 확인 → 2) 법인 영향(원가/마진/리드타임) 1차 산정 → 3) 필요 시 HQ 리스크 대응 착수
+
+        <div class="box" style="font-size:12px;">
+          <b>HQ 공통 체크(요약)</b><br/>
+          1) 정책 근거(법/고시/행정명령) 및 시행/적용 시점 구분<br/>
+          2) 대상국·대상품목(HS)·거래유형(수입/수출/부품) 매핑<br/>
+          3) 생산→판매 법인 순서로 영향(원가/마진/리드타임/특혜관세 실패·추징) 1차 산정
         </div>
       </div>
     </body></html>
@@ -377,7 +553,7 @@ def write_outputs(df, html_body):
     return csv_path, xlsx_path, html_path
 
 # ===============================
-# MAIL (실무/임원 공용)
+# MAIL (공용)
 # ===============================
 def send_mail_to(recipients, subject, html_body):
     if not recipients:
@@ -398,31 +574,31 @@ def send_mail_to(recipients, subject, html_body):
 # MAIN
 # ===============================
 def main():
-    today = now_kst().strftime("%Y-%m-%d")
-    today_csv = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
+    now = now_kst()
+    today = now.strftime("%Y-%m-%d")
 
-    # 1) 오늘 CSV 있으면 사용, 없으면 센서 실행
-    if os.path.exists(today_csv):
-        df = load_events()
-    else:
-        df = run_sensor_build_df()
+    # 1) 센서 실행(07~07)
+    df = run_sensor_build_df()
 
     if df is None or df.empty:
-        print("오늘 수집된 이벤트/뉴스 없음")
+        print("오늘 수집된 이벤트/뉴스 없음 (07~07 KST)")
+        print("BASE_DIR =", BASE_DIR)
+        print("OUT_FILES =", os.listdir(BASE_DIR))
         return
 
+    # 2) 컬럼/정렬 보정
     df = ensure_cols(df)
 
-    # 실무자용
-    html_body = build_html(df)
+    # 3) 실무자용 HTML(표)
+    html_body = build_html_practitioner(df)
     write_outputs(df, html_body)
-    send_mail_to(RECIPIENTS, f"관세·무역 뉴스 브리핑 ({today})", html_body)
+    send_mail_to(RECIPIENTS, f"관세·통상 데일리 브리프 ({today})", html_body)
 
-    # 임원용
+    # 4) 임원용 TOP3
     exec_html = build_html_exec(df)
     send_mail_to(RECIPIENTS_EXEC, f"[Executive] 관세·통상 핵심 TOP3 ({today})", exec_html)
 
-    print("✅ 점수 고도화 + 임원/실무 분리 발송 완료")
+    print("✅ 07~07 수집 + 08 발송용 컨텐츠 생성 완료")
     print("BASE_DIR =", BASE_DIR)
     print("OUT_FILES =", os.listdir(BASE_DIR))
 
