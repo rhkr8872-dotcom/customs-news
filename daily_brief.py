@@ -40,10 +40,24 @@ def now_kst():
 def load_events():
     today = now_kst().strftime("%Y-%m-%d")
     path = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
-    if not os.path.exists(path):
-        files = sorted(f for f in os.listdir(BASE_DIR) if f.startswith("policy_events_"))
-        path = os.path.join(BASE_DIR, files[-1])
+
+    # 1) 오늘 파일이 있으면 그걸 읽음
+    if os.path.exists(path):
+        return pd.read_csv(path)
+
+    # 2) 없으면 폴더에서 가장 최신 policy_events_*.csv 찾기
+    files = sorted(
+        f for f in os.listdir(BASE_DIR)
+        if f.startswith("policy_events_") and f.endswith(".csv")
+    )
+
+    # ✅ 핵심: 아무 파일도 없으면 빈 DF 반환 (첫 실행/초기 상태 대응)
+    if not files:
+        return pd.DataFrame()
+
+    path = os.path.join(BASE_DIR, files[-1])
     return pd.read_csv(path)
+
 
 # ===============================
 # SAFE COLUMNS (FORM ONLY)
@@ -249,11 +263,16 @@ def send_mail(html_body):
 # ===============================
 def main():
     df = load_events()
+    if df is None or df.empty:
+        print("최근 policy_events CSV가 없습니다. (초기 실행 상태) out/에 CSV가 생성되도록 센서 생성 로직을 먼저 실행하거나, CSV 생성 단계가 필요합니다.")
+        return
+
     df = ensure_cols(df)
     html_body = build_html(df)
     write_outputs(df, html_body)
     send_mail(html_body)
     print("✅ v5.18.6.6 FORM FINAL 완료")
+
 
 if __name__ == "__main__":
     main()
