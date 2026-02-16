@@ -1,18 +1,19 @@
- # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Samsung Electronics | Customs & Trade Daily Brief
-FINAL v5.18.6.6 – FORM FINAL (SAMPLE.mht REPLICA)
+E2E: Sensor + Outputs + Mail (Practitioner + Executive)
 
-✔ Sensor logic: NO CHANGE
-✔ Output FORM only refinement
-✔ TOP3 policy relevance filter applied
+- Google News RSS 기반 센서 (PC 없이 GitHub Actions에서 구동)
+- out/에 CSV/XLSX/HTML 저장
+- 실무자용 메일 + 임원용 TOP3 메일 분리
+- 정책성 점수(리스크 스코어) 고도화
 """
+
 # ===============================
 # IMPORT
 # ===============================
-import os, re, sys, html, smtplib, traceback
+import os, re, html, smtplib
 import datetime as dt
-from typing import List
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -21,7 +22,68 @@ import feedparser
 import urllib.parse
 
 # ===============================
-# SENSOR (NEWS RSS) + COUNTRY TAG
+# ENV
+# ===============================
+SMTP_SERVER   = os.getenv("SMTP_SERVER")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_EMAIL    = os.getenv("SMTP_EMAIL")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
+RECIPIENTS = [x.strip() for x in os.getenv("RECIPIENTS", "").split(",") if x.strip()]
+RECIPIENTS_EXEC = [x.strip() for x in os.getenv("RECIPIENTS_EXEC", "").split(",") if x.strip()]
+
+BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(__file__), "out"))
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# ===============================
+# TIME
+# ===============================
+def now_kst():
+    return dt.datetime.utcnow() + dt.timedelta(hours=9)
+
+# ===============================
+# POLICY SCORE (3) 고도화
+# ===============================
+RISK_RULES = [
+    ("section 301", 6),
+    ("section 232", 6),
+    ("ieepa", 6),
+    ("export control", 6),
+    ("sanction", 6),
+    ("entity list", 5),
+    ("anti-dumping", 5),
+    ("countervailing", 5),
+    ("safeguard", 5),
+
+    ("tariff", 4),
+    ("duty", 4),
+    ("관세", 4),
+    ("관세율", 4),
+    ("추가관세", 4),
+
+    ("hs code", 3),
+    ("hs", 3),
+    ("원산지", 3),
+    ("fta", 3),
+    ("customs", 3),
+    ("통관", 3),
+
+    ("규정", 2),
+    ("시행", 2),
+    ("개정", 2),
+    ("고시", 2),
+]
+
+def calc_policy_score(title: str, summary: str) -> int:
+    t = f"{title} {summary}".lower()
+    score = 1
+    for kw, w in RISK_RULES:
+        if kw in t:
+            score += w
+    return min(score, 20)
+
+# ===============================
+# COUNTRY TAG (2에서 만든 기능 유지)
 # ===============================
 COUNTRY_KEYWORDS = {
     "USA": ["u.s.", "united states", "america", "section 301", "section 232"],
@@ -42,6 +104,9 @@ def detect_country(text: str) -> str:
             return country
     return ""
 
+# ===============================
+# SENSOR (완전 자동)
+# ===============================
 def run_sensor_build_df() -> pd.DataFrame:
     """
     Google News RSS 기반 '관세' 관련 뉴스 수집 → DF 생성
@@ -67,6 +132,7 @@ def run_sensor_build_df() -> pd.DataFrame:
         summary = re.sub(r"<[^>]+>", "", summary).strip()
 
         country = detect_country(f"{title} {summary}")
+        score = calc_policy_score(title, summary)
 
         rows.append({
             "제시어": query,
@@ -76,30 +142,14 @@ def run_sensor_build_df() -> pd.DataFrame:
             "중요도": "중",
             "발표일": published,
             "출처(URL)": link,
-            "근거건수": 1
+            "근거건수": 1,
+            "점수": score,
         })
 
     return pd.DataFrame(rows)
 
-
 # ===============================
-# ENV
-# ===============================
-SMTP_SERVER   = os.getenv("SMTP_SERVER")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_EMAIL    = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-RECIPIENTS    = [x.strip() for x in os.getenv("RECIPIENTS","").split(",") if x.strip()]
-BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(__file__), "out"))
-os.makedirs(BASE_DIR, exist_ok=True)
-# ===============================
-# TIME
-# ===============================
-def now_kst():
-    return dt.datetime.utcnow() + dt.timedelta(hours=9)
-
-# ===============================
-# LOAD EVENTS (UNCHANGED)
+# LOAD EVENTS (기존 파일 있으면 활용)
 # ===============================
 def load_events():
     today = now_kst().strftime("%Y-%m-%d")
@@ -119,35 +169,37 @@ def load_events():
     return pd.read_csv(path)
 
 # ===============================
-# SAFE COLUMNS (FORM ONLY)
+# SAFE COLUMNS
 # ===============================
 def ensure_cols(df):
     df = df.copy()
 
+    # 점수는 센서에서 만들면 유지, 없으면 기본 매핑
     if "점수" not in df.columns:
-        score_map = {"상":9,"중":6,"하":3}
-        df["점수"] = df.get("중요도","하").map(score_map).fillna(1)
+        score_map = {"상": 9, "중": 6, "하": 3}
+        df["점수"] = df.get("중요도", "하").map(score_map).fillna(1)
 
     if "제시어" not in df.columns:
-        for c in ["policy_keyword","keyword","카테고리","분류"]:
+        for c in ["policy_keyword", "keyword", "카테고리", "분류"]:
             if c in df.columns:
                 df["제시어"] = df[c]
                 break
         else:
             df["제시어"] = "관세"
+
     return df
 
 # ===============================
 # LINK
 # ===============================
 def get_link(r):
-    for c in ["출처(URL)","URL","link","원본링크","originallink"]:
+    for c in ["출처(URL)", "URL", "link", "원본링크", "originallink"]:
         if c in r and pd.notna(r[c]):
             return r[c]
     return "#"
 
 # ===============================
-# TOP3 POLICY FILTER (FORM ONLY)
+# TOP3 POLICY FILTER
 # ===============================
 ALLOW = [
     "관세","tariff","관세율","hs","section 232","section 301","ieepa",
@@ -165,7 +217,7 @@ def is_valid_top3(r):
     return any(a in blob for a in ALLOW)
 
 # ===============================
-# HTML BUILD
+# HTML STYLE
 # ===============================
 STYLE = """
 <style>
@@ -181,10 +233,12 @@ th{background:#f0f0f0;}
 </style>
 """
 
+# ===============================
+# HTML BUILD (실무자용)
+# ===============================
 def build_html(df):
     date = now_kst().strftime("%Y-%m-%d")
 
-    # ---------- TOP3 ----------
     cand = df[df.apply(is_valid_top3, axis=1)]
     top3 = cand.sort_values("점수", ascending=False).head(3)
 
@@ -193,17 +247,15 @@ def build_html(df):
         top3_html += f"""
         <li>
           <b>[{r['제시어']}｜{r.get('대상 국가','')}｜점수 {r['점수']}]</b><br/>
-          <a href="{get_link(r)}" target="_blank">{html.escape(r['헤드라인'])}</a><br/>
+          <a href="{get_link(r)}" target="_blank">{html.escape(str(r['헤드라인']))}</a><br/>
           <div class="small">{html.escape(str(r.get('주요내용',''))[:260])}</div>
         </li>
         """
 
-    # ---------- WHY ----------
     why_html = ""
     for _, r in top3.iterrows():
         why_html += f"<li>[{r['제시어']} | 근거 {r.get('근거건수',1)}건] 정책 변화 가능성으로 원가·마진·리드타임 영향</li>"
 
-    # ---------- CHECK ----------
     chk_html = ""
     for _, r in top3.iterrows():
         chk_html += f"""
@@ -214,19 +266,18 @@ def build_html(df):
         </li>
         """
 
-    # ---------- TABLE ----------
     rows = ""
     for _, r in df.iterrows():
         rows += f"""
         <tr>
-          <td>{r['제시어']} ({r.get('중요도','')})</td>
+          <td>{r.get('제시어','')} ({r.get('중요도','')})</td>
           <td>
-            <a href="{get_link(r)}" target="_blank">{html.escape(r['헤드라인'])}</a><br/>
+            <a href="{get_link(r)}" target="_blank">{html.escape(str(r.get('헤드라인','')))}</a><br/>
             {html.escape(str(r.get('주요내용','')))}
           </td>
           <td>{r.get('발표일','')}</td>
           <td>{r.get('대상 국가','')}</td>
-          <td>점수 {r['점수']}</td>
+          <td>점수 {r.get('점수','')}</td>
         </tr>
         """
 
@@ -271,79 +322,109 @@ def build_html(df):
     """
 
 # ===============================
-# MAIL
+# HTML BUILD (임원용)
 # ===============================
+def build_html_exec(df):
+    date = now_kst().strftime("%Y-%m-%d")
+    cand = df[df.apply(is_valid_top3, axis=1)]
+    top3 = cand.sort_values("점수", ascending=False).head(3)
+
+    items = ""
+    for _, r in top3.iterrows():
+        items += f"""
+        <li>
+          <b>[{r.get('대상 국가','')} | 점수 {r.get('점수','')}]</b><br/>
+          <a href="{get_link(r)}" target="_blank">{html.escape(str(r.get('헤드라인','')))}</a><br/>
+          <div class="small">{html.escape(str(r.get('주요내용',''))[:220])}</div>
+        </li>
+        """
+
+    return f"""
+    <html><head>{STYLE}</head>
+    <body>
+      <div class="page">
+        <h2>[Executive] 관세·통상 핵심 TOP3 ({date})</h2>
+        <div class="box">
+          <ul>{items}</ul>
+        </div>
+        <div class="box">
+          <b>Action</b><br/>
+          1) 대상국/품목(HS) 확인 → 2) 법인 영향(원가/마진/리드타임) 1차 산정 → 3) 필요 시 HQ 리스크 대응 착수
+        </div>
+      </div>
+    </body></html>
+    """
 
 # ===============================
 # WRITE OUTPUTS (CSV/XLSX/HTML)
 # ===============================
 def write_outputs(df, html_body):
-    """
-    Save daily outputs into BASE_DIR:
-      - policy_events_YYYY-MM-DD.csv
-      - policy_events_YYYY-MM-DD.xlsx
-      - policy_events_YYYY-MM-DD.html
-    """
     today = now_kst().strftime("%Y-%m-%d")
     csv_path  = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
     xlsx_path = os.path.join(BASE_DIR, f"policy_events_{today}.xlsx")
     html_path = os.path.join(BASE_DIR, f"policy_events_{today}.html")
 
-    # CSV / XLSX
     try:
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     except TypeError:
-        # pandas older versions may not accept encoding in to_csv on some paths
         df.to_csv(csv_path, index=False)
+
     df.to_excel(xlsx_path, index=False)
 
-    # HTML
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_body)
 
     return csv_path, xlsx_path, html_path
 
+# ===============================
+# MAIL (실무/임원 공용)
+# ===============================
+def send_mail_to(recipients, subject, html_body):
+    if not recipients:
+        return
 
-
-def send_mail(html_body):
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"관세·무역 뉴스 브리핑 ({now_kst().strftime('%Y-%m-%d')})"
+    msg["Subject"] = subject
     msg["From"] = SMTP_EMAIL
-    msg["To"] = ", ".join(RECIPIENTS)
-    msg.attach(MIMEText(html_body,"html","utf-8"))
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
         s.starttls()
         s.login(SMTP_EMAIL, SMTP_PASSWORD)
-        s.sendmail(SMTP_EMAIL, RECIPIENTS, msg.as_string())
+        s.sendmail(SMTP_EMAIL, recipients, msg.as_string())
 
 # ===============================
 # MAIN
 # ===============================
 def main():
-    print("BASE_DIR =", BASE_DIR)
-    print("OUT_FILES =", os.listdir(BASE_DIR))
     today = now_kst().strftime("%Y-%m-%d")
     today_csv = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
 
-    # 1) 오늘 CSV가 있으면 사용, 없으면 센서로 생성
+    # 1) 오늘 CSV 있으면 사용, 없으면 센서 실행
     if os.path.exists(today_csv):
         df = load_events()
     else:
         df = run_sensor_build_df()
 
-    # 2) 결과가 없으면 종료 (메일/파일 생성 안 함)
     if df is None or df.empty:
         print("오늘 수집된 이벤트/뉴스 없음")
         return
 
-    # 3) 폼 보정 → HTML → 출력 저장 → 메일 발송
     df = ensure_cols(df)
+
+    # 실무자용
     html_body = build_html(df)
     write_outputs(df, html_body)
-    send_mail(html_body)
-    print("✅ 센서+메일러 통합 완료")
+    send_mail_to(RECIPIENTS, f"관세·무역 뉴스 브리핑 ({today})", html_body)
 
+    # 임원용
+    exec_html = build_html_exec(df)
+    send_mail_to(RECIPIENTS_EXEC, f"[Executive] 관세·통상 핵심 TOP3 ({today})", exec_html)
+
+    print("✅ 점수 고도화 + 임원/실무 분리 발송 완료")
+    print("BASE_DIR =", BASE_DIR)
+    print("OUT_FILES =", os.listdir(BASE_DIR))
 
 if __name__ == "__main__":
     main()
