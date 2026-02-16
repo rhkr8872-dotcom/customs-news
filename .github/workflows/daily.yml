@@ -1,5 +1,5 @@
 name: daily-customs-brief
-
+contents: write
 on:
   schedule:
     - cron: "0 21 * * *"   # UTC 21:00 = 한국 06:00
@@ -51,7 +51,19 @@ jobs:
           name: outputs-${{ github.run_id }}
           path: out/**
           if-no-files-found: ignore
+      - name: Commit & push outputs to repo
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
 
+          # out/ 아래 결과물 추가
+          git add out/
+
+          # 변경 없으면 커밋 스킵
+          git commit -m "Daily outputs: $(date -u +'%Y-%m-%d')" || echo "No changes to commit"
+
+          # main 브랜치로 push
+          git push
       - name: Commit daily outputs
         run: |
           git config --global user.name "github-actions"
@@ -60,4 +72,3 @@ jobs:
           git commit -m "Daily policy events update $(date +'%Y-%m-%d')" || echo "No changes to commit"
           git push
           permissions:
-        contents: write
