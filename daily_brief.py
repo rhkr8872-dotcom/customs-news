@@ -1,6 +1,4 @@
-def run_sensor_build_df() -> pd.DataFrame:
-    
-    # -*- coding: utf-8 -*-
+ # -*- coding: utf-8 -*-
 """
 Samsung Electronics | Customs & Trade Daily Brief
 FINAL v5.18.6.6 – FORM FINAL (SAMPLE.mht REPLICA)
@@ -287,6 +285,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# TODO: 기존 센서 코드(daily news)에 있는 수집/정제 로직을 이 함수로 옮기세요.
-    # 예시(임시): 데이터가 없으면 빈 DF 반환
-    return pd.DataFrame()
