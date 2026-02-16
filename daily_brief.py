@@ -1,4 +1,6 @@
-# -*- coding: utf-8 -*-
+def run_sensor_build_df() -> pd.DataFrame:
+    
+    # -*- coding: utf-8 -*-
 """
 Samsung Electronics | Customs & Trade Daily Brief
 FINAL v5.18.6.6 – FORM FINAL (SAMPLE.mht REPLICA)
@@ -41,22 +43,20 @@ def load_events():
     today = now_kst().strftime("%Y-%m-%d")
     path = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
 
-    # 1) 오늘 파일이 있으면 그걸 읽음
     if os.path.exists(path):
         return pd.read_csv(path)
 
-    # 2) 없으면 폴더에서 가장 최신 policy_events_*.csv 찾기
     files = sorted(
         f for f in os.listdir(BASE_DIR)
         if f.startswith("policy_events_") and f.endswith(".csv")
     )
-
-    # ✅ 핵심: 아무 파일도 없으면 빈 DF 반환 (첫 실행/초기 상태 대응)
     if not files:
         return pd.DataFrame()
 
     path = os.path.join(BASE_DIR, files[-1])
     return pd.read_csv(path)
+
+
 
 
 # ===============================
@@ -262,17 +262,31 @@ def send_mail(html_body):
 # MAIN
 # ===============================
 def main():
-    df = load_events()
+    today = now_kst().strftime("%Y-%m-%d")
+    today_csv = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
+
+    # 1) 오늘 CSV가 없으면 센서를 실행해서 df 생성
+    if not os.path.exists(today_csv):
+        df = run_sensor_build_df()
+    else:
+        df = load_events()
+
+    # 2) 센서/CSV 모두 결과가 없으면 종료 (메일/파일 생성 안 함)
     if df is None or df.empty:
-        print("최근 policy_events CSV가 없습니다. (초기 실행 상태) out/에 CSV가 생성되도록 센서 생성 로직을 먼저 실행하거나, CSV 생성 단계가 필요합니다.")
+        print("최근 신규/변경 정책 이벤트 없음 (DF empty)")
         return
 
+    # 3) 폼 보정 → HTML → 출력 저장 → 메일 발송
     df = ensure_cols(df)
     html_body = build_html(df)
     write_outputs(df, html_body)
     send_mail(html_body)
-    print("✅ v5.18.6.6 FORM FINAL 완료")
+    print("✅ 센서+메일러 통합 완료")
+
 
 
 if __name__ == "__main__":
     main()
+# TODO: 기존 센서 코드(daily news)에 있는 수집/정제 로직을 이 함수로 옮기세요.
+    # 예시(임시): 데이터가 없으면 빈 DF 반환
+    return pd.DataFrame()
