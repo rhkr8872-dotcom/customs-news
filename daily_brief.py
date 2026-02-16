@@ -319,6 +319,8 @@ def main():
     write_outputs(df, html_body)
     send_mail(html_body)
     print("✅ 센서+메일러 통합 완료")
+print("BASE_DIR =", BASE_DIR)
+print("OUT_FILES =", os.listdir(BASE_DIR))
 
 
 if __name__ == "__main__":
