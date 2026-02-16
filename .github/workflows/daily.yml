@@ -51,3 +51,11 @@ jobs:
           name: outputs-${{ github.run_id }}
           path: out/**
           if-no-files-found: ignore
+
+      - name: Commit daily outputs
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add out/*
+          git commit -m "Daily policy events update $(date +'%Y-%m-%d')" || echo "No changes to commit"
+          git push
