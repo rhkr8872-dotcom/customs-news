@@ -248,3 +248,5 @@ def main():
 
 if __name__=="__main__":
     main()
+print("RECIPIENTS count =", len(RECIPIENTS))
+print("RECIPIENTS_EXEC count =", len(RECIPIENTS_EXEC))
