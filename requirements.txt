@@ -1,3 +1,5 @@
 feedparser
 openpyxl
 pandas
+requests
+beautifulsoup4
