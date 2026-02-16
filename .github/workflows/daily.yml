@@ -37,3 +37,4 @@ jobs:
         with:
           name: outputs-${{ github.run_id }}
           path: out/**
+          if-no-files-found: ignore
