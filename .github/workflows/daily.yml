@@ -21,6 +21,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare out dir
+        run: |
+          mkdir -p out
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "Listing repo root:"
+          ls -al
+
       - name: Run script
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
@@ -31,6 +38,12 @@ jobs:
           BASE_DIR: ${{ github.workspace }}/out
         run: |
           python daily_brief.py
+
+      - name: List out dir (always)
+        if: always()
+        run: |
+          echo "Listing out/:"
+          ls -al out || true
 
       - name: Upload outputs
         uses: actions/upload-artifact@v4
