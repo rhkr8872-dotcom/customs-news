@@ -56,6 +56,25 @@ def run_sensor_build_df() -> pd.DataFrame:
             "출처(URL)": link,
             "근거건수": 1
         })
+COUNTRY_KEYWORDS = {
+    "USA": ["u.s.", "united states", "america", "section 301", "section 232"],
+    "India": ["india"],
+    "Türkiye": ["turkey"],
+    "Vietnam": ["vietnam"],
+    "Netherlands": ["netherlands", "dutch"],
+    "EU": ["european union", "eu commission"],
+    "China": ["china"],
+    "Mexico": ["mexico"],
+    "Brazil": ["brazil"]
+}
+
+def detect_country(text):
+    t = text.lower()
+    for country, keys in COUNTRY_KEYWORDS.items():
+        if any(k in t for k in keys):
+            return country
+    return ""
+country = detect_country(title + " " + summary)
 
     return pd.DataFrame(rows)
 
@@ -319,9 +338,9 @@ def main():
     write_outputs(df, html_body)
     send_mail(html_body)
     print("✅ 센서+메일러 통합 완료")
+
 print("BASE_DIR =", BASE_DIR)
 print("OUT_FILES =", os.listdir(BASE_DIR))
-
 
 if __name__ == "__main__":
     main()
