@@ -59,3 +59,5 @@ jobs:
           git add out/*
           git commit -m "Daily policy events update $(date +'%Y-%m-%d')" || echo "No changes to commit"
           git push
+          permissions:
+  contents: write
