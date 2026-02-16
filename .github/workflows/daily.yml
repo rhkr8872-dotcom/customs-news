@@ -38,6 +38,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
           BASE_DIR: ${{ github.workspace }}/out
+          RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
         run: |
           python daily_brief.py
 
