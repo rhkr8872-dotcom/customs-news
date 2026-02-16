@@ -17,6 +17,48 @@ from typing import List
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import pandas as pd
+import feedparser
+import urllib.parse
+
+def run_sensor_build_df() -> pd.DataFrame:
+    """
+    Google News RSS 기반 '관세' 관련 뉴스 수집 → DF 생성
+    (GitHub Actions에서 가장 안정적으로 동작)
+    """
+    query = os.getenv("NEWS_QUERY", "관세")
+    # Google News RSS (한국어)
+    rss = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": query,
+        "hl": "ko",
+        "gl": "KR",
+        "ceid": "KR:ko"
+    })
+
+    feed = feedparser.parse(rss)
+
+    rows = []
+    for e in feed.entries[:30]:  # 상위 30개
+        title = getattr(e, "title", "").strip()
+        link = getattr(e, "link", "").strip()
+        published = getattr(e, "published", "")
+
+        # summary는 HTML 포함일 수 있음 → 텍스트만 대충 정리
+        summary = getattr(e, "summary", "")
+        summary = re.sub(r"<[^>]+>", "", summary).strip()
+
+        rows.append({
+            "제시어": query,
+            "헤드라인": title,
+            "주요내용": summary[:500],
+            "대상 국가": "",       # RSS로는 국가 추출 어려움 → 비워둠
+            "중요도": "중",        # 기본값
+            "발표일": published,
+            "출처(URL)": link,
+            "근거건수": 1
+        })
+
+    return pd.DataFrame(rows)
+
 
 # ===============================
 # ENV
@@ -53,9 +95,6 @@ def load_events():
 
     path = os.path.join(BASE_DIR, files[-1])
     return pd.read_csv(path)
-
-
-
 
 # ===============================
 # SAFE COLUMNS (FORM ONLY)
@@ -263,15 +302,15 @@ def main():
     today = now_kst().strftime("%Y-%m-%d")
     today_csv = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
 
-    # 1) 오늘 CSV가 없으면 센서를 실행해서 df 생성
-    if not os.path.exists(today_csv):
-        df = run_sensor_build_df()
-    else:
+    # 1) 오늘 CSV가 있으면 사용, 없으면 센서로 생성
+    if os.path.exists(today_csv):
         df = load_events()
+    else:
+        df = run_sensor_build_df()
 
-    # 2) 센서/CSV 모두 결과가 없으면 종료 (메일/파일 생성 안 함)
+    # 2) 결과가 없으면 종료 (메일/파일 생성 안 함)
     if df is None or df.empty:
-        print("최근 신규/변경 정책 이벤트 없음 (DF empty)")
+        print("오늘 수집된 이벤트/뉴스 없음")
         return
 
     # 3) 폼 보정 → HTML → 출력 저장 → 메일 발송
@@ -280,7 +319,6 @@ def main():
     write_outputs(df, html_body)
     send_mail(html_body)
     print("✅ 센서+메일러 통합 완료")
-
 
 
 if __name__ == "__main__":
