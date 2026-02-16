@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Samsung Electronics | Customs & Trade Daily Brief
-E2E: Sensor + Outputs + Mail (Practitioner + Executive)
+vNext (E2E): Sensor + Outputs + Mail (Practitioner + Executive)
 
-✅ Google News RSS 기반 센서 (PC 없이 GitHub Actions에서 구동)
+✅ Google News RSS 기반 센서 (GitHub Actions 구동)
 ✅ 수집 기간: 전날 07:00(KST) ~ 당일 07:00(KST)
-✅ 메일 발송: 08:00(KST) (GitHub Actions cron은 별도 설정)
-✅ out/에 CSV/XLSX/HTML 저장
-✅ 실무자용 메일(표 중심) + 임원용 TOP3(Trigger/Exposure/Action 포함) 분리
-✅ 제목=요약 중복 완화 + 정책성 점수(리스크 스코어) 고도화
+✅ 메일 발송: 08:00(KST) (cron은 daily.yml에서 설정)
+✅ out/에 CSV/XLSX/HTML 저장 + Artifact 업로드
+✅ 실무자용(표 중심) + 임원용 TOP3(Trigger/Exposure/Action) 분리
+✅ 요약 품질 강화: 원문 og:description / meta description 추출로 제목=요약 문제 개선
 """
 
 # ===============================
@@ -26,6 +26,10 @@ import pandas as pd
 import feedparser
 import urllib.parse
 
+# vNext: 원문 메타 요약 추출
+import requests
+from bs4 import BeautifulSoup
+
 # ===============================
 # ENV
 # ===============================
@@ -41,7 +45,14 @@ BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(__file__), "out"))
 os.makedirs(BASE_DIR, exist_ok=True)
 
 NEWS_QUERY = os.getenv("NEWS_QUERY", "관세")
-NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "50"))  # 시간 필터 때문에 여유롭게 50개 권장
+NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "60"))  # 시간 필터 후 남는 수량을 고려해 여유
+FETCH_META_MAX = int(os.getenv("FETCH_META_MAX", "12"))  # 원문 메타 추출 최대 건수 (과도 호출 방지)
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "10"))
+
+USER_AGENT = os.getenv(
+    "HTTP_UA",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+)
 
 # ===============================
 # TIME
@@ -55,11 +66,10 @@ def window_kst_07_to_07():
     """
     now = now_kst()
     end = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    # end는 "가장 최근의 07:00"
+    # end는 "가장 최근의 07:00" (실행이 08시라면 end는 오늘 07:00)
     if now < end:
-        end = end  # 오늘 07:00
-    else:
-        end = end  # 오늘 07:00
+        # 07시 이전 실행이면 end는 오늘 07시(미래)라서 그대로 두면 안 됨 -> 어제 07시로 내림
+        end = end - dt.timedelta(days=1)
     start = end - dt.timedelta(days=1)
     return start, end
 
@@ -126,7 +136,6 @@ def calc_policy_score(title: str, summary: str) -> int:
     return min(score, 20)
 
 def score_to_importance(score: int) -> str:
-    # 상: 관세율/HS/법령급 트리거 가능성이 높은 점수대
     if score >= 13:
         return "상"
     if score >= 7:
@@ -193,7 +202,6 @@ def infer_exposure(country: str) -> str:
     return "주요 생산법인(상위 3개) 우선 스크리닝 후 판매법인 확장"
 
 def build_action_48h(trigger: str, country: str) -> str:
-    # HTML로 바로 넣기 위해 <br/> 사용
     return (
         "1) 적용 시점/대상국/대상품목(HS) 확인<br/>"
         "2) 생산→판매 법인 순서로 원가/마진/리드타임 1차 산정<br/>"
@@ -234,36 +242,64 @@ def is_valid_top3(r):
     return any(a in blob for a in ALLOW)
 
 # ===============================
-# SENSOR (완전 자동 / 07~07 필터 적용)
+# vNext: 원문 메타 요약 추출
 # ===============================
-def clean_summary(title: str, summary: str) -> str:
+def safe_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def fetch_meta_summary(url: str) -> str:
+    """
+    원문 페이지에서 og:description / meta[name=description] 추출
+    실패하면 "" 반환
+    """
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if resp.status_code != 200 or not resp.text:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # og:description 우선
+        og = soup.find("meta", property="og:description")
+        if og and og.get("content"):
+            return safe_text(og["content"])
+
+        # meta description
+        md = soup.find("meta", attrs={"name": "description"})
+        if md and md.get("content"):
+            return safe_text(md["content"])
+
+        return ""
+    except Exception:
+        return ""
+
+def clean_rss_summary(title: str, summary: str) -> str:
     """
     RSS 특성상 summary가 title과 같거나 title을 포함하는 경우가 많아 중복을 완화.
     """
-    t = (title or "").strip()
-    s = (summary or "").strip()
+    t = safe_text(title)
+    s = safe_text(re.sub(r"<[^>]+>", "", summary or ""))
 
     if not s:
         return ""
-
-    # HTML 태그 제거
-    s = re.sub(r"<[^>]+>", "", s).strip()
-
-    # title이 summary에 포함되면 제거 시도
     if s == t:
         return ""
     if t and t in s:
-        s2 = re.sub(re.escape(t), "", s).strip(" -–—|:·\t")
-        # 너무 짧아지면 원문 유지
+        s2 = safe_text(re.sub(re.escape(t), "", s)).strip(" -–—|:·")
         if len(s2) >= 20:
             return s2
-
     return s
 
+# ===============================
+# SENSOR (완전 자동 / 07~07 필터 + 메타요약 대체)
+# ===============================
 def run_sensor_build_df() -> pd.DataFrame:
     """
     Google News RSS 기반 NEWS_QUERY 관련 뉴스 수집 → DF 생성
     수집기간: 전날 07:00(KST) ~ 당일 07:00(KST)
+    vNext: 요약이 빈약하면 원문 메타 설명으로 대체
     """
     rss = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
         "q": NEWS_QUERY,
@@ -276,45 +312,56 @@ def run_sensor_build_df() -> pd.DataFrame:
     start, end = window_kst_07_to_07()
 
     rows = []
-    for e in feed.entries[:NEWS_LIMIT]:
-        title = getattr(e, "title", "").strip()
-        link = getattr(e, "link", "").strip()
+    meta_fetch_count = 0
 
-        # 출처 불명확하면 제외
+    for e in feed.entries[:NEWS_LIMIT]:
+        title = safe_text(getattr(e, "title", ""))
+        link = safe_text(getattr(e, "link", ""))
+
         if not link:
             continue
 
         published_kst = parse_published_to_kst(e)
-        # 추정 금지: 발표일 없으면 제외(원하시면 빈칸으로 포함 가능)
         if published_kst is None:
+            # 추정 금지
             continue
 
-        # 07~07 범위 필터
+        # 07~07 범위
         if not (start <= published_kst < end):
             continue
 
-        summary_raw = getattr(e, "summary", "") or ""
-        summary = clean_summary(title, summary_raw)
+        rss_summary_raw = getattr(e, "summary", "") or ""
+        rss_summary = clean_rss_summary(title, rss_summary_raw)
 
-        # 정책 관련성 낮으면 제외(요구사항: 관련 없는 정보 출력 금지)
-        if not is_trade_policy_related(title, summary):
+        # 정책 관련성 판단은 RSS 기반으로 1차 (원문 호출 전에 불필요 트래픽 줄임)
+        if not is_trade_policy_related(title, rss_summary):
             continue
 
-        # 요약이 너무 빈약하면 최소 문구(원하시면 빈칸으로 바꿔도 됨)
-        if not summary:
-            summary = "요약정보 부족(원문 링크 확인 필요)"
+        final_summary = rss_summary
 
-        country = detect_country(f"{title} {summary}")
-        score = calc_policy_score(title, summary)
+        # vNext: 요약이 없거나 너무 짧으면 메타요약 시도(최대 FETCH_META_MAX건)
+        if (not final_summary or len(final_summary) < 60) and meta_fetch_count < FETCH_META_MAX:
+            meta = fetch_meta_summary(link)
+            meta_fetch_count += 1
+            # 메타가 유의미하면 대체
+            if meta and meta.lower() != title.lower() and len(meta) >= 60:
+                final_summary = meta
+
+        # 그래도 없으면 최소 문구(원하시면 빈칸으로 바꾸셔도 됩니다)
+        if not final_summary:
+            final_summary = "요약정보 부족(원문 링크 확인 필요)"
+
+        country = detect_country(f"{title} {final_summary}")
+        score = calc_policy_score(title, final_summary)
         importance = score_to_importance(score)
 
         rows.append({
             "제시어": NEWS_QUERY,
             "헤드라인": title,
-            "주요내용": summary[:500],
+            "주요내용": final_summary[:600],
             "발표일": published_kst.strftime("%Y-%m-%d %H:%M"),
             "대상 국가": country,
-            "관련 기관": "",  # RSS만으로는 정확한 기관 식별이 어려워 빈칸(추정 금지)
+            "관련 기관": "",  # 추정 금지(원문 파싱으로 개선 가능하지만 현재는 빈칸 유지)
             "출처(URL)": link,
             "중요도": importance,
             "비고": "",
@@ -323,31 +370,11 @@ def run_sensor_build_df() -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
-
-    # 중복 제거(헤드라인+링크 기준)
     if not df.empty:
         df = df.drop_duplicates(subset=["헤드라인", "출처(URL)"], keep="first")
+        df = df.sort_values(["점수", "발표일"], ascending=[False, False])
 
     return df
-
-# ===============================
-# LOAD EVENTS (기존 파일 있으면 활용)
-# ===============================
-def load_events():
-    today = now_kst().strftime("%Y-%m-%d")
-    path = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
-    if os.path.exists(path):
-        return pd.read_csv(path)
-
-    files = sorted(
-        f for f in os.listdir(BASE_DIR)
-        if f.startswith("policy_events_") and f.endswith(".csv")
-    )
-    if not files:
-        return pd.DataFrame()
-
-    path = os.path.join(BASE_DIR, files[-1])
-    return pd.read_csv(path)
 
 # ===============================
 # SAFE COLUMNS / ORDER
@@ -369,7 +396,6 @@ def ensure_cols(df):
         if c not in df.columns:
             df[c] = ""
 
-    # 출력 컬럼 정렬
     for c in OUT_COLS:
         if c not in df.columns:
             df[c] = ""
@@ -411,7 +437,6 @@ def build_html_practitioner(df):
     date = now_kst().strftime("%Y-%m-%d")
     start, end = window_kst_07_to_07()
 
-    # TOP3
     cand = df[df.apply(is_valid_top3, axis=1)] if not df.empty else df
     top3 = cand.sort_values("점수", ascending=False).head(3) if not cand.empty else df.head(3)
 
@@ -427,12 +452,11 @@ def build_html_practitioner(df):
         </li>
         """
 
-    # 표 rows
     rows = ""
     for _, r in df.iterrows():
         rows += f"""
         <tr>
-          <td>{html.escape(str(r.get('주요내용',''))[:400])}</td>
+          <td>{html.escape(str(r.get('주요내용',''))[:500])}</td>
           <td>{html.escape(str(r.get('발표일','')))}</td>
           <td>{html.escape(str(r.get('대상 국가','')))}</td>
           <td>{html.escape(str(r.get('관련 기관','')))}</td>
@@ -574,33 +598,30 @@ def send_mail_to(recipients, subject, html_body):
 # MAIN
 # ===============================
 def main():
-    now = now_kst()
-    today = now.strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
 
-    # 1) 센서 실행(07~07)
     df = run_sensor_build_df()
-
     if df is None or df.empty:
         print("오늘 수집된 이벤트/뉴스 없음 (07~07 KST)")
         print("BASE_DIR =", BASE_DIR)
         print("OUT_FILES =", os.listdir(BASE_DIR))
         return
 
-    # 2) 컬럼/정렬 보정
     df = ensure_cols(df)
 
-    # 3) 실무자용 HTML(표)
+    # 실무자용
     html_body = build_html_practitioner(df)
     write_outputs(df, html_body)
     send_mail_to(RECIPIENTS, f"관세·통상 데일리 브리프 ({today})", html_body)
 
-    # 4) 임원용 TOP3
+    # 임원용
     exec_html = build_html_exec(df)
     send_mail_to(RECIPIENTS_EXEC, f"[Executive] 관세·통상 핵심 TOP3 ({today})", exec_html)
 
-    print("✅ 07~07 수집 + 08 발송용 컨텐츠 생성 완료")
+    print("✅ vNext 완료: 메타요약 적용 + 실무/임원 분리 발송")
     print("BASE_DIR =", BASE_DIR)
     print("OUT_FILES =", os.listdir(BASE_DIR))
+    print("FETCH_META_MAX =", FETCH_META_MAX)
 
 if __name__ == "__main__":
     main()
