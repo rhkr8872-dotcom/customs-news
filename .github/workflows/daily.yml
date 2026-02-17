@@ -2,7 +2,7 @@ name: daily-customs-brief
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00
+    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00 (메일 발송)
   workflow_dispatch:
 
 jobs:
@@ -21,6 +21,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare out dir
+        run: |
+          mkdir -p out
+
       - name: Run script
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
@@ -29,12 +33,11 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
           RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BASE_DIR: ${{ github.workspace }}/out
-          QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
+          CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
           SITES_FILE: ${{ github.workspace }}/sites.xlsx
-          NEWS_LANGS: "ko,en,fr"
-          NEWS_REGION: "KR"
-          NEWS_QUERY_EXPAND: "1"
+          WINDOW_START_HOUR_KST: "7"
         run: |
           python daily_brief.py
 
