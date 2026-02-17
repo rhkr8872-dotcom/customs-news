@@ -120,17 +120,33 @@ def load_custom_queries(path: str) -> list:
         raise ValueError("custom_queries.TXT is empty after filtering.")
     return out
 
-def _normalize_url(u: str) -> str:
-    u = (u or "").strip()
-    if not u or u.lower() == "nan":
-        return ""
-    # If user wrote a domain without scheme
-    if re.match(r"^https?://", u, re.I) is None:
-        # if it's clearly not a URL (contains spaces, Korean-only name), reject
-        if " " in u or "." not in u:
+def _normalize_url(u) -> str:
+    # NaN/None/float 등 어떤 타입이 와도 안전하게 처리
+    try:
+        import pandas as pd
+        if u is None or (isinstance(u, float) and (u != u)):  # NaN 체크
             return ""
-        u = "https://" + u
+        # pandas NaN도 커버
+        try:
+            if pd.isna(u):
+                return ""
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    u = str(u).strip()
+    if not u or u.lower() in ("nan", "none"):
+        return ""
+
+    # 엑셀 하이퍼링크/텍스트가 URL 아닌 경우도 방어
+    # (필요하면 더 확장 가능)
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return ""
+
+    # 마지막 슬래시 통일 등(선택)
     return u
+
 
 def _get_domain(u: str) -> str:
     try:
