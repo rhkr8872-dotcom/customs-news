@@ -1,6 +1,6 @@
+pandas
 feedparser
 openpyxl
-pandas
 requests
 beautifulsoup4
 python-dateutil
