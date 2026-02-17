@@ -2,8 +2,9 @@ name: daily-customs-brief
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # UTC 23:00 = 한국 08:00
+    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00
   workflow_dispatch:
+
 
 jobs:
   run:
@@ -35,6 +36,8 @@ jobs:
           RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
           BASE_DIR: ${{ github.workspace }}/out
           NEWS_QUERY: "관세"
+          WINDOW_START_HOUR: "7"
+          WINDOW_END_HOUR: "7"
         run: |
           python daily_brief.py
 
