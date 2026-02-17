@@ -1,3 +1,4 @@
+print("GEMINI_API_KEY =", bool(os.getenv("GEMINI_API_KEY")))
 # -*- coding: utf-8 -*-
 """
 Samsung Electronics | Customs & Trade Daily Brief
