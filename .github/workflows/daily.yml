@@ -5,7 +5,6 @@ on:
     - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00
   workflow_dispatch:
 
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -22,10 +21,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Prepare out dir
-        run: |
-          mkdir -p out
-
       - name: Run script
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
@@ -35,9 +30,11 @@ jobs:
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
           RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
           BASE_DIR: ${{ github.workspace }}/out
-          NEWS_QUERY: "관세"
-          WINDOW_START_HOUR: "7"
-          WINDOW_END_HOUR: "7"
+          QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
+          SITES_FILE: ${{ github.workspace }}/sites.xlsx
+          NEWS_LANGS: "ko,en,fr"
+          NEWS_REGION: "KR"
+          NEWS_QUERY_EXPAND: "1"
         run: |
           python daily_brief.py
 
