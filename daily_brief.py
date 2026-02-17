@@ -622,7 +622,12 @@ def send_mail_to(recipients, subject, html_body):
 # ===============================
 def main():
     queries = load_custom_queries(QUERIES_FILE)
-    domain_to_name, allowed_domains = load_sites_xlsx(SITES_FILE)
+    domain_to_name, allowed_domains, sites_df = load_sites_xlsx_strict(SITES_FILE)
+
+    print("[DEBUG] sites loaded:", len(sites_df))
+    # 필요 시 sites_df를 out/에 저장해서 검증 가능
+    # sites_df.to_csv(os.path.join(BASE_DIR, "sites_cleaned.csv"), index=False, encoding="utf-8-sig")
+
 
     ref = now_kst()
     w_start, w_end = collection_window_kst(ref)
@@ -653,3 +658,162 @@ def main():
 
 if __name__ == "__main__":
     main()
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Dict, Set, Tuple, Optional
+from urllib.parse import urlparse
+
+import pandas as pd
+from openpyxl import load_workbook
+
+
+# ===============================
+# Helpers
+# ===============================
+def _safe_str(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+
+def _normalize_url(u) -> str:
+    u = _safe_str(u)
+    if not u or u.lower() in ("nan", "none"):
+        return ""
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return ""
+    return u
+
+
+def _extract_host(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    host = host.replace("www.", "").strip()
+    return host
+
+
+def _looks_like_header(v: str) -> str:
+    # 컬럼명 유사치 표준화
+    v = _safe_str(v).lower()
+    v = re.sub(r"\s+", "", v)
+    return v
+
+
+# ===============================
+# Strict Loader
+# ===============================
+@dataclass
+class SitesXlsxConfig:
+    # 시트명 우선순위 (없으면 첫 시트 사용)
+    preferred_sheets: Tuple[str, ...] = ("SiteList", "Sitelist", "sites", "Sites", "Sheet1")
+    # 헤더 후보 (name/url 컬럼 인식)
+    name_headers: Tuple[str, ...] = ("name", "기관명", "기관", "사이트명", "source", "source_name")
+    url_headers: Tuple[str, ...] = ("url", "link", "주소", "사이트", "homepage", "source_url")
+
+
+def load_sites_xlsx_strict(
+    xlsx_path: str,
+    cfg: SitesXlsxConfig = SitesXlsxConfig(),
+) -> Tuple[Dict[str, str], Set[str], pd.DataFrame]:
+    """
+    sites.xlsx에서:
+      - name / url 컬럼을 '헤더 기준'으로 타이트하게 찾고
+      - URL은 "셀 하이퍼링크"를 최우선으로 사용 (표시 텍스트가 URL이 아니어도 OK)
+      - http/https 아닌 값/빈칸/NaN은 제거
+      - 결과:
+          domain_to_name: {domain: name}
+          allowed_domains: set(domains)
+          cleaned_df: 정제된 DataFrame(name, url, domain)
+    """
+
+    wb = load_workbook(xlsx_path, data_only=True)
+
+    # 1) 시트 선택
+    sheet = None
+    for s in cfg.preferred_sheets:
+        if s in wb.sheetnames:
+            sheet = wb[s]
+            break
+    if sheet is None:
+        sheet = wb[wb.sheetnames[0]]
+
+    # 2) 헤더 행 찾기: 1~30행에서 name/url 둘 다 발견되는 첫 행 사용
+    name_idx = None
+    url_idx = None
+    header_row = None
+
+    for r in range(1, min(sheet.max_row, 30) + 1):
+        row_vals = [sheet.cell(row=r, column=c).value for c in range(1, min(sheet.max_column, 50) + 1)]
+        norm = [_looks_like_header(v) for v in row_vals]
+
+        # name/url 후보 인덱스 찾기
+        tmp_name = None
+        tmp_url = None
+
+        for i, h in enumerate(norm):
+            if any(h == _looks_like_header(x) for x in cfg.name_headers):
+                tmp_name = i + 1
+            if any(h == _looks_like_header(x) for x in cfg.url_headers):
+                tmp_url = i + 1
+
+        if tmp_name and tmp_url:
+            name_idx, url_idx = tmp_name, tmp_url
+            header_row = r
+            break
+
+    if not (name_idx and url_idx and header_row):
+        raise ValueError(
+            f"sites.xlsx에서 헤더를 찾지 못했습니다. "
+            f"시트={sheet.title} / 'name'과 'url' 컬럼(헤더)이 필요합니다."
+        )
+
+    # 3) 데이터 읽기 (하이퍼링크 우선)
+    items = []
+    for r in range(header_row + 1, sheet.max_row + 1):
+        name_cell = sheet.cell(row=r, column=name_idx)
+        url_cell = sheet.cell(row=r, column=url_idx)
+
+        name = _safe_str(name_cell.value)
+
+        # URL은 1) 하이퍼링크 target 2) 셀 value(텍스트)
+        url = ""
+        if url_cell.hyperlink and url_cell.hyperlink.target:
+            url = _safe_str(url_cell.hyperlink.target)
+        else:
+            url = _safe_str(url_cell.value)
+
+        url = _normalize_url(url)
+
+        if not name or not url:
+            continue
+
+        domain = _extract_host(url)
+        if not domain:
+            continue
+
+        items.append({"name": name, "url": url, "domain": domain, "sheet": sheet.title, "row": r})
+
+    cleaned_df = pd.DataFrame(items)
+
+    # 4) 도메인 맵 구성
+    domain_to_name: Dict[str, str] = {}
+    allowed_domains: Set[str] = set()
+
+    for _, r in cleaned_df.iterrows():
+        d = r["domain"]
+        n = r["name"]
+        # 동일 도메인 중복이면 최초 1개 유지(원하면 name merge로 바꿀 수 있음)
+        if d not in domain_to_name:
+            domain_to_name[d] = n
+        allowed_domains.add(d)
+
+    return domain_to_name, allowed_domains, cleaned_df
