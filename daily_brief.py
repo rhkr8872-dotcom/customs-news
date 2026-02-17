@@ -179,41 +179,35 @@ def _pick_sites_sheet(xls: pd.ExcelFile) -> str:
             return sh
     return xls.sheet_names[0]
 
-def load_sites_xlsx(path: str):
-    """
-    sites.xlsx:
-      - 최소 컬럼: name, url
-      - url이 빈 값/비URL(텍스트)인 행은 제외
-    Returns:
-      - domain_to_name: {domain -> 기관명}
-      - allowed_domains: set(domains)
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"sites.xlsx not found: {path}")
+def load_sites_xlsx(path):
+    import pandas as pd
+    df = pd.read_excel(path, sheet_name=0, dtype=str)  # ⭐ dtype=str 로 강제
 
-    xls = pd.ExcelFile(path)
-    sh = _pick_sites_sheet(xls)
-    df = xls.parse(sh)
+    # 컬럼명 표준화(대소문자/공백)
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    # normalize columns
-    df = df.rename(columns={c: str(c).strip().lower() for c in df.columns})
+    # 기대 컬럼: name, url
     if "name" not in df.columns or "url" not in df.columns:
-        raise ValueError(f"sites.xlsx sheet '{sh}' must have columns: name, url")
+        raise ValueError("sites.xlsx에 'name', 'url' 컬럼이 필요합니다.")
 
-    df = df[["name", "url"]].copy()
-    df["name"] = df["name"].astype(str).str.strip()
-    df["url"] = df["url"].astype(str).apply(_normalize_url)
+    df["name"] = df["name"].fillna("").astype(str).str.strip()
+    df["url"]  = df["url"].fillna("").astype(str).apply(_normalize_url)
 
-    df = df[(df["name"] != "") & (df["url"] != "")]
-    df["domain"] = df["url"].apply(_get_domain)
-    df = df[df["domain"] != ""]
+    # url 비어있으면 제거 (⭐ 여기서 float/NaN 문제 완전 차단)
+    df = df[(df["name"] != "") & (df["url"] != "")].copy()
 
     domain_to_name = {}
+    allowed_domains = set()
     for _, r in df.iterrows():
-        domain_to_name[r["domain"]] = r["name"]
+        # 도메인 추출(예: https://www.customs.go.kr/... -> customs.go.kr)
+        from urllib.parse import urlparse
+        host = urlparse(r["url"]).netloc.lower()
+        host = host.replace("www.", "")
+        domain_to_name[host] = r["name"]
+        allowed_domains.add(host)
 
-    allowed_domains = set(domain_to_name.keys())
     return domain_to_name, allowed_domains
+
 
 # ===============================
 # MULTI-LANG QUERY EXPANSION (deterministic)
