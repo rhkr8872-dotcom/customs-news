@@ -2,7 +2,7 @@ name: daily-customs-brief
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # UTC 23:00 = 한국 08:00 (발송 08시)
+    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00 (메일 발송)
   workflow_dispatch:
 
 jobs:
@@ -31,20 +31,12 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
           RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
-
-          # Gemini
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_ENABLED: "1"
-
-          # Files
           BASE_DIR: ${{ github.workspace }}/out
           CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
           SITES_FILE: ${{ github.workspace }}/sites.xlsx
-
-          # Time window (KST 07~07)
           WINDOW_START_HOUR_KST: "7"
         run: |
           python daily_brief.py
