@@ -208,6 +208,31 @@ def _normalize_url(u) -> str:
     u = re.sub(r"(#.*)$", "", u)
     return u
 
+
+def get_link(r) -> str:
+    """Safely extract a URL from a pandas Series/dict-like row."""
+    if r is None:
+        return "#"
+    for c in ["출처(URL)", "url", "URL", "link", "원본링크", "originallink", "source_url", "SourceURL"]:
+        try:
+            v = r.get(c) if hasattr(r, "get") else r[c]
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        # pandas may store NaN as float
+        try:
+            if isinstance(v, float):
+                if v != v:  # NaN
+                    continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        if not s or s.lower() in {"nan", "none"}:
+            continue
+        return _normalize_url(s)
+    return "#"
+
 def _domain(url: str) -> str:
     try:
         m = re.search(r"https?://([^/]+)/?", url)
