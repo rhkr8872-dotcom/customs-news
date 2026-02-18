@@ -178,26 +178,35 @@ def _clean_text(s: str) -> str:
     return s
 
 
+
 def _normalize_url(u) -> str:
-    # pandas에서 NaN/float 들어오는 케이스 방어
-    if u is None:
-        return ""
+    """Normalize URL values read from Excel.
+    - Handles NaN/None/float/numpy scalars safely
+    - Adds https:// if missing
+    """
     try:
-        if isinstance(u, float):
+        # pandas/NumPy NaN 방어
+        if u is None or (hasattr(pd, "isna") and pd.isna(u)):
             return ""
+    except Exception:
+        if u is None:
+            return ""
+
+    # numpy scalar / other types to str
+    try:
         u = str(u)
     except Exception:
         return ""
-    u = (u or "").strip()
+
+    u = u.strip()
     if not u:
         return ""
-    # scheme 없으면 https 가정
+
     if not re.match(r"^https?://", u, flags=re.I):
         u = "https://" + u
-    # 트래킹 파라미터 최소 제거
+
     u = re.sub(r"(#.*)$", "", u)
     return u
-
 
 def _domain(url: str) -> str:
     try:
@@ -290,77 +299,72 @@ def load_custom_queries(path: str) -> List[str]:
     return uniq
 
 
-def load_sites_xlsx(path: str) -> Tuple[Dict[str, str], set]:
-    """sites.xlsx 로딩(단단하게):
-    - 시트명 우선순위: SiteList, sites, Sheet1, 첫번째 시트
-    - 필수 컬럼: name, url (대소문자/공백/한글 변형 약간 허용)
+
+def load_sites_xlsx(path: str):
+    """sites.xlsx 로더 (타이트 + 관용)
+    기대 구조:
+      - Sheet: SiteList (권장) / 또는 'sites' / 또는 첫 시트
+      - Columns: name, url  (대소문자/공백 차이는 허용)
+
     반환:
-      domain_to_name: {domain: name}
-      allowed_domains: set(domains)
+      (domain_to_name: dict[str,str], allowed_domains: set[str])
     """
     if not os.path.exists(path):
-        raise FileNotFoundError(f"sites.xlsx not found: {path}")
+        print(f"[WARN] sites.xlsx not found: {path}")
+        return {}, set()
 
     xls = pd.ExcelFile(path)
-    sheet_candidates = []
+
+    # 1) 우선순위: SiteList -> sites -> 첫 시트
+    candidates = []
     for s in xls.sheet_names:
-        sheet_candidates.append(s)
-    # 우선순위 정렬
-    preferred = ["SiteList", "sites", "SITELIST", "Sheet1"]
-    ordered = []
-    for p in preferred:
-        if p in sheet_candidates:
-            ordered.append(p)
-    for s in sheet_candidates:
-        if s not in ordered:
-            ordered.append(s)
+        sl = s.strip().lower()
+        if sl == "sitelist":
+            candidates.insert(0, s)
+        elif sl == "sites":
+            candidates.append(s)
+    if not candidates:
+        candidates = [xls.sheet_names[0]]
 
-    last_err = None
-    for sheet in ordered:
-        try:
-            df = pd.read_excel(path, sheet_name=sheet)
-            if df is None or df.empty:
-                continue
-            # 컬럼명 정규화
-            cols = {str(c).strip().lower(): c for c in df.columns}
-            # 허용 변형
-            name_col = None
-            url_col = None
-            for k in ["name", "기관명", "site", "사이트", "기관", "source"]:
-                if k in cols:
-                    name_col = cols[k]
-                    break
-            for k in ["url", "링크", "주소", "link"]:
-                if k in cols:
-                    url_col = cols[k]
-                    break
-            if not name_col or not url_col:
-                continue
+    df = None
+    picked = None
+    for s in candidates:
+        tmp = pd.read_excel(xls, sheet_name=s)
+        cols = {str(c).strip().lower(): c for c in tmp.columns}
+        if "name" in cols and "url" in cols:
+            df = tmp.rename(columns={cols["name"]: "name", cols["url"]: "url"})
+            picked = s
+            break
 
-            df = df[[name_col, url_col]].copy()
-            df.columns = ["name", "url"]
-            df["name"] = df["name"].astype(str).fillna("").apply(lambda x: str(x).strip())
-            df["url"] = df["url"].apply(_normalize_url)
-            df = df[df["url"].astype(bool)]
+    # 2) 그래도 못 찾으면, 전체 시트 스캔
+    if df is None:
+        for s in xls.sheet_names:
+            tmp = pd.read_excel(xls, sheet_name=s)
+            cols = {str(c).strip().lower(): c for c in tmp.columns}
+            if "name" in cols and "url" in cols:
+                df = tmp.rename(columns={cols["name"]: "name", cols["url"]: "url"})
+                picked = s
+                break
 
-            domain_to_name: Dict[str, str] = {}
-            for _, r in df.iterrows():
-                d = _domain(r["url"])
-                if not d:
-                    continue
-                # 같은 도메인 중복이면 첫 값 유지
-                domain_to_name.setdefault(d, r["name"])
-            allowed = set(domain_to_name.keys())
-            return domain_to_name, allowed
-        except Exception as e:
-            last_err = e
+    if df is None:
+        raise ValueError(f"sites.xlsx must contain columns 'name' and 'url' in some sheet. Found sheets: {xls.sheet_names}")
 
-    raise ValueError(f"sites.xlsx parse failed. sheets={xls.sheet_names}. last_error={last_err}")
+    df = df[["name", "url"]].copy()
+    df["name"] = df["name"].astype(str).str.strip()
+    df["url"] = df["url"].apply(_normalize_url)
 
+    # url 빈값 제거
+    df = df[df["url"] != ""].copy()
 
-# ===============================
-# MULTI-LANG QUERY EXPANSION
-# ===============================
+    # 도메인 추출
+    df["domain"] = df["url"].apply(_domain)
+    df = df[df["domain"] != ""].copy()
+
+    domain_to_name = dict(zip(df["domain"], df["name"]))
+    allowed_domains = set(domain_to_name.keys())
+
+    print(f"[INFO] sites.xlsx loaded: sheet='{picked}', rows={len(df)}, domains={len(allowed_domains)}")
+    return domain_to_name, allowed_domains
 
 def expand_query(base_kw: str, langs: List[str]) -> List[str]:
     """제시어를 언어별로 확장.
@@ -436,6 +440,131 @@ def gemini_summarize_ko(title: str, snippet: str, url: str, max_lines: int = 3) 
         return None
 
 
+
+# ===============================
+# RELEVANCE / DEDUP / SUMMARY HELPERS
+# ===============================
+# 당사(삼성전자) 관점 키워드 (제품/사업/공급망)
+SAMSUNG_RELEVANCE_KW = [
+    # 제품군
+    "smartphone","phone","mobile","tablet","galaxy","smart watch","watch","earbuds","bluetooth",
+    "tv","monitor","soundbar","refrigerator","fridge","air conditioner","ac","oven","vacuum",
+    "5g","base station","antenna","network equipment",
+    "x-ray","medical device",
+    # 공급망/통관/정책
+    "import","export","customs","tariff","duty","hs","origin","fta","sanction","export control",
+    "anti-dumping","countervailing","safeguard","section 301","section 232","ieepa",
+    # 국가/법인(대표 생산거점)
+    "korea","china","vietnam","india","indonesia","turkey","türkiye","slovakia","poland","mexico","brazil","eu","european union",
+]
+
+# 당사 비관련(명확히 제외) 키워드 — 예: 주류/와인 등
+NEGATIVE_KW = [
+    "wine","whisky","whiskey","beer","vodka","champagne",
+    "restaurant","recipe","celebrity","sports","football","baseball",
+]
+
+def _is_relevant_for_top3(title: str, summary: str, country: str) -> bool:
+    t = f"{title} {summary}".lower()
+    if any(k in t for k in NEGATIVE_KW):
+        return False
+    # 정책 키워드(관세/통상)가 반드시 있어야 함
+    policy_hit = any(k in t for k in ["tariff","duty","customs","관세","관세율","추가관세","hs","section 301","section 232","ieepa","fta","원산지","수출통제","export control","sanction","anti-dumping","countervailing","safeguard"])
+    if not policy_hit:
+        return False
+    # 당사 연관성(제품/공급망/주요 생산국) 중 하나라도 히트
+    rel_hit = (country != "") or any(k in t for k in SAMSUNG_RELEVANCE_KW)
+    return rel_hit
+
+def _norm_title(t: str) -> str:
+    t = (t or "").strip()
+    # 구글뉴스 제목은 "... - 매체" 형태가 많아 중복 발생 → 뒤쪽 매체명 제거
+    t = re.sub(r"\s+-\s+[^-]{2,}$", "", t).strip()
+    t = re.sub(r"\s+", " ", t)
+    return t.lower()
+
+def dedup_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    d["_tkey"] = d.get("헤드라인", "").apply(_norm_title)
+    d["_lkey"] = d.get("출처(URL)", "").fillna("").astype(str).str.strip().str.lower()
+    d["_dedup"] = d["_tkey"] + "|" + d["_lkey"]
+    d = d.sort_values(["점수"], ascending=False, kind="mergesort")
+    d = d.drop_duplicates(subset=["_dedup"], keep="first").drop(columns=["_tkey","_lkey","_dedup"], errors="ignore")
+    return d
+
+def _fallback_korean_summary(title: str, summary: str, max_lines: int = 3) -> str:
+    """Gemini가 없거나 실패했을 때: RSS summary에서 2~3줄로 정리"""
+    s = (summary or "").strip()
+    if not s:
+        return ""
+    # 제목 복제 제거
+    if _norm_title(s) == _norm_title(title):
+        return ""
+    # 문장 단위로 자르기(한국어/영어 혼합 대응)
+    parts = re.split(r"(?<=[\.\!\?。])\s+|(?<=\.)\s+|(?<=\?)\s+|(?<=\!)\s+|(?<=\n)", s)
+    parts = [p.strip() for p in parts if p.strip()]
+    out = []
+    for p in parts:
+        if len(" ".join(out) + " " + p) > 320:
+            break
+        out.append(p)
+        if len(out) >= max_lines:
+            break
+    return "\n".join(out).strip()
+
+def ensure_summaries(df: pd.DataFrame) -> pd.DataFrame:
+    """요약이 비거나(또는 제목과 동일)하면 Gemini(가능 시)로 강제 요약, 실패 시 fallback"""
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+    d["요약"] = d.get("주요내용", "").fillna("").astype(str)
+
+    # Gemini 사용 가능 여부 (키 없으면 자동 OFF)
+    gemini_on = GEMINI_ENABLED and bool(GEMINI_API_KEY)
+    if gemini_on:
+        print("[INFO] GEMINI_ENABLED=1 (API key present)")
+    else:
+        print(f"[INFO] GEMINI_ENABLED=0 (GEMINI_API_KEY present? {bool(GEMINI_API_KEY)})")
+
+    for i, r in d.iterrows():
+        title = str(r.get("헤드라인", ""))
+        summ = str(r.get("요약", ""))
+        bad = (not summ.strip()) or (_norm_title(summ) == _norm_title(title))
+        if not bad:
+            continue
+
+        # Gemini 요약 시도
+        if gemini_on:
+            try:
+                # 너무 길면 축약해서 전달
+                prompt = (
+                    "다음 뉴스의 핵심을 한국어로 2~3문장(불릿X)으로 요약해줘. "
+                    "관세/통상/통관 관련 정책 포인트가 있으면 반드시 포함해줘.\n\n"
+                    f"제목: {title}\n"
+                    f"원문요약(RSS): {summ[:1200]}\n"
+                )
+                gs = gemini_generate_text(prompt)
+                gs = (gs or "").strip()
+                if gs:
+                    d.at[i, "요약"] = gs
+                    continue
+            except Exception as e:
+                print(f"[WARN] Gemini summary failed: {e}")
+
+        # fallback
+        fb = _fallback_korean_summary(title, summ, max_lines=3)
+        if fb:
+            d.at[i, "요약"] = fb
+        else:
+            # 최후: RSS summary가 제목 복제뿐이면 제목을 1줄로만
+            d.at[i, "요약"] = "(요약정보 부족 — 원문 링크 확인 필요)"
+
+    # '주요내용' 컬럼을 요약으로 교체(기존 로직 호환)
+    d["주요내용"] = d["요약"]
+    return d
 # ===============================
 # SENSOR
 # ===============================
@@ -534,38 +663,40 @@ def importance_label(score: int) -> str:
     return "하"
 
 
+
 def pick_top3(df: pd.DataFrame, allowed_domains: set) -> pd.DataFrame:
+    """TOP3 선정 로직 (정책성 + 당사연관성 + 사이트 신뢰도)
+    - '당사 비관련(NEGATIVE_KW)'은 제외
+    - Gemini 요약이 없더라도 ensure_summaries()에서 최소 요약 확보
+    """
     if df is None or df.empty:
-        return df
+        return pd.DataFrame()
 
-    # TOP3는 "정책/관세" 강도 + 당사 연관성 필터를 더 강하게
-    tmp = df.copy()
-    tmp["중요도"] = tmp["점수"].apply(importance_label)
+    cand = df.copy()
 
-    def ok_row(r) -> bool:
+    def ok_row(r):
         title = str(r.get("헤드라인", ""))
-        snip = str(r.get("주요내용", ""))
-        url = str(r.get("출처(URL)", ""))
-        # 무관(와인 등) 강제 제외
-        if not is_trade_related(title, snip):
+        summ = str(r.get("주요내용", ""))
+        country = str(r.get("대상 국가", ""))
+        if not is_trade_related(title, summ):
             return False
-        # 당사 연관성 기준: allowed domain OR 연관성 점수 >= 4
-        return (_domain(url) in allowed_domains) or (int(r.get("연관성", 0)) >= 4)
+        if not _is_relevant_for_top3(title, summ, country):
+            return False
+        # 도메인 화이트리스트가 있으면 우선 통과, 없으면 그대로 허용
+        link = get_link(r)
+        dom = _domain(link)
+        if allowed_domains:
+            return dom in allowed_domains
+        return True
 
-    tmp = tmp[tmp.apply(ok_row, axis=1)].copy()
-    if tmp.empty:
-        # 너무 빡세면 완화
-        tmp = df.copy()
-        tmp["중요도"] = tmp["점수"].apply(importance_label)
+    cand = cand[cand.apply(ok_row, axis=1)].copy()
+    if cand.empty:
+        return pd.DataFrame()
 
-    # 정렬: 점수 desc, 연관성 desc
-    tmp = tmp.sort_values(["점수", "연관성"], ascending=[False, False]).head(3).reset_index(drop=True)
-    return tmp
-
-
-# ===============================
-# OUTPUTS
-# ===============================
+    cand["_rel"] = cand.apply(lambda r: relevance_score(str(r.get("헤드라인", "")), str(r.get("주요내용", ""))), axis=1)
+    cand = cand.sort_values(["점수", "_rel"], ascending=[False, False], kind="mergesort")
+    out = cand.head(3).drop(columns=["_rel"], errors="ignore")
+    return out
 
 def write_outputs(df: pd.DataFrame, html_prac: str, html_exec: str) -> Tuple[str, str, str, str]:
     today = now_kst().strftime("%Y-%m-%d")
@@ -653,71 +784,58 @@ def _fallback_snippet_ko(title: str, snippet: str) -> str:
     return sn[:270]
 
 
-def build_top3_blocks(df_top3: pd.DataFrame, allowed_domains: set) -> Tuple[str, str, str]:
-    """TOP3 HTML(li), WHY(통합), CHECK(통합)"""
-    items_html = ""
-    why_lines = []
-    check_lines = []
 
-    for _, r in df_top3.iterrows():
-        kw = str(r.get("제시어", ""))
-        country = str(r.get("대상 국가", ""))
-        score = int(r.get("점수", 0))
-        imp = importance_label(score)
+def build_top3_blocks(top3: pd.DataFrame):
+    """TOP3 영역(①/②/③) HTML 조각 생성"""
+    if top3 is None or top3.empty:
+        empty = "<li>(조건에 맞는 TOP3 이벤트가 없습니다 — 표(④)에서 전체 목록 확인)</li>"
+        return empty, empty, empty
+
+    prod_line = "모바일/태블릿/웨어러블, 생활가전, 네트워크 장비, 의료기기"
+    base_line = "한국·중국·베트남·인도·인도네시아·튀르키예·슬로바키아·폴란드·멕시코·브라질"
+
+    # ① TOP3
+    top3_html = ""
+    for _, r in top3.iterrows():
         title = str(r.get("헤드라인", ""))
-        url = str(r.get("출처(URL)", ""))
-        snippet = str(r.get("주요내용", ""))
+        summ = str(r.get("주요내용", ""))
+        ctry = str(r.get("대상 국가", ""))
+        kw = str(r.get("제시어", ""))
+        score = r.get("점수", "")
+        top3_html += f"""
+<li>
+  <b>[{kw}｜{ctry}｜점수 {score}]</b><br/>
+  <a href="{get_link(r)}" target="_blank">{html.escape(title)}</a><br/>
+  <div class="small">{html.escape(summ)}</div>
+</li>
+"""
 
-        # 요약(한글) 강제
-        summ = gemini_summarize_ko(title, snippet, url, max_lines=3)
-        if not summ:
-            summ = _fallback_snippet_ko(title, snippet)
-
-        items_html += f"""
-        <li>
-          <b>[{kw}｜{country}｜{imp}｜점수 {score}]</b><br/>
-          <a href=\"{html.escape(url)}\" target=\"_blank\">{html.escape(title)}</a><br/>
-          <div class=\"small\">{summ}</div>
-        </li>
-        """
-
-        # WHY (중복 최소화)
-        why = f"[{kw}|{country}|{imp}] 관세/통상 정책 변화 가능성 → 수입원가·판매가·마진 및 리드타임 영향(생산/판매법인 검토 필요)"
-        why_lines.append(why)
-
-        # CHECK (당사 템플릿 강화)
-        prod_hint = "모바일/가전/네트워크/의료"  # 기본
-        if country in ["USA", "EU"]:
-            prod_hint = "미국/유럽향 판매 + 글로벌 생산법인(베트남/인도/멕시코/폴란드/슬로바키아 등)" \
-                        "의 원산지·HS·추가관세 영향"
-        elif country in ["India", "Vietnam", "Mexico", "Brazil", "China"]:
-            prod_hint = f"{country} 생산/판매법인" \
-                        " 기준 수입부품 과세/통관/원산지 영향"
-
-        chk = (
-            f"[{kw}|{country}|{imp}] 우선 확인: 1) 대상국/대상품목(HS)·적용시점 2) "
-            f"당사 생산/판매 매핑({prod_hint}) 3) 특혜(FTA) 적용/원산지 리스크 4) "
-            "필요 시 HQ 대응(가격/소싱/선적/CO)"
+    # ② 왜 중요한가 (중복 최소화: 이벤트별 1줄)
+    why_lines = []
+    for _, r in top3.iterrows():
+        ctry = str(r.get("대상 국가", "")) or "(국가미상)"
+        kw = str(r.get("제시어", ""))
+        why_lines.append(
+            f"[{kw}｜{ctry}] 관세/통상 조치 변화 가능성 → 수입원가·판매가·마진·리드타임 영향. " 
+            f"당사 주요 제품({prod_line}) 및 주요 생산거점({base_line}) 공급망에 파급 가능."
         )
-        check_lines.append(chk)
+    # 완전 동일 문구 제거
+    why_lines = list(dict.fromkeys(why_lines))
+    why_html = "".join(f"<li>{html.escape(x)}</li>" for x in why_lines)
 
-    # 중복 제거(문장 단위)
-    def dedup(lines: List[str]) -> List[str]:
-        seen = set()
-        out = []
-        for l in lines:
-            k = re.sub(r"\s+", " ", l).strip()
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(l)
-        return out
+    # ③ 당사 관점 체크포인트 (이벤트별 Action)
+    chk_lines = []
+    for _, r in top3.iterrows():
+        ctry = str(r.get("대상 국가", "")) or "(국가미상)"
+        kw = str(r.get("제시어", ""))
+        chk_lines.append(
+            f"[{kw}｜{ctry}] 1) 적용 시점/대상국/대상품목(HS) 확인 → 2) 생산·판매 법인별 영향(원가/마진/리드타임) 1차 산정 → " 
+            f"3) 필요 시 FTA/원산지·수출통제·제재 리스크 동시 점검 및 HQ 대응 착수"
+        )
+    chk_lines = list(dict.fromkeys(chk_lines))
+    chk_html = "".join(f"<li>{html.escape(x)}</li>" for x in chk_lines)
 
-    why_html = "".join(f"<li>{html.escape(l)}</li>" for l in dedup(why_lines))
-    check_html = "".join(f"<li>{html.escape(l)}</li>" for l in dedup(check_lines))
-
-    return items_html, why_html, check_html
-
+    return top3_html, why_html, chk_html
 
 def build_table(df: pd.DataFrame) -> Tuple[str, str]:
     """실무자용 표: 제시어별 top N + 건수라인"""
