@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Samsung Electronics | Customs & Trade Daily Brief (GitHub Actions STABLE)
+Samsung Electronics | Customs & Trade Daily Brief (STABLE + Gemini Summary)
 
-Goals (STABLE):
-- Read queries from custom_queries.TXT  (one per line)
-- Read official / approved sites from sites.xlsx (sheet "SiteList", columns: name, url)
-- Collect Google News RSS within time window (KST 07:00~07:00; send at 08:00 via workflow schedule)
-- Deduplicate
-- Executive mail: TOP3 + (② Why / ③ Checkpoint)  (same content as practitioner, WITHOUT the big table)
-- Practitioner mail: same as executive + ④ Policy Event Table (tight A4 landscape)
-- Gemini optional: Korean 2~3 sentence summary (if GEMINI_ENABLED=1 and GEMINI_API_KEY exists)
-  Fallback: RSS snippet 3 lines
+핵심 개선:
+- TOP3 및 표 요약이 "제목=요약"으로 비는 문제 해결:
+  - URL 본문을 (가능한 범위에서) 추출 → Gemini 요약 강제
+  - Gemini 불가/실패 시: 본문(또는 RSS)에서 2~3줄 발췌 fallback
+- Gemini는 GEMINI_ENABLED=1 & GEMINI_API_KEY 존재 시 사용
+- 요약 호출/본문 fetch는 MAX_SUMMARY_CALLS(기본 20)로 제한
 """
 
-import os, re, html, smtplib, traceback
+import os, re, html, smtplib
 import datetime as dt
-from typing import List, Dict, Tuple, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlencode
 
 import pandas as pd
 import feedparser
@@ -34,623 +30,694 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 RECIPIENTS = [x.strip() for x in os.getenv("RECIPIENTS", "").split(",") if x.strip()]
 RECIPIENTS_EXEC = [x.strip() for x in os.getenv("RECIPIENTS_EXEC", "").split(",") if x.strip()]
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "0").strip() in ("1", "true", "True", "YES", "yes")
+
 BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(__file__), "out"))
+os.makedirs(BASE_DIR, exist_ok=True)
+
 CUSTOM_QUERIES_FILE = os.getenv("CUSTOM_QUERIES_FILE", os.path.join(os.path.dirname(__file__), "custom_queries.TXT"))
 SITES_FILE = os.getenv("SITES_FILE", os.path.join(os.path.dirname(__file__), "sites.xlsx"))
 
-WINDOW_START_HOUR_KST = int(os.getenv("WINDOW_START_HOUR_KST", "7"))  # 07:00~07:00
-MAX_ITEMS_PER_QUERY = int(os.getenv("MAX_ITEMS_PER_QUERY", "30"))
-MAX_TABLE_PER_KEYWORD = int(os.getenv("MAX_TABLE_PER_KEYWORD", "10"))
-
-GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "0").strip() in ("1", "true", "True", "YES", "yes")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
-os.makedirs(BASE_DIR, exist_ok=True)
+WINDOW_START_HOUR_KST = int(os.getenv("WINDOW_START_HOUR_KST", "7"))  # 07~07
+# 발송은 워크플로 스케줄로 08시 실행하도록 설정 (코드에서 강제 sleep 하지 않음)
 
 # ===============================
 # TIME
 # ===============================
-def now_kst() -> dt.datetime:
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).astimezone(dt.timezone(dt.timedelta(hours=9)))
+def now_kst():
+    return dt.datetime.utcnow() + dt.timedelta(hours=9)
 
-def window_kst() -> Tuple[dt.datetime, dt.datetime]:
-    """Return (start,end) KST for last window ending at today's WINDOW_START_HOUR_KST."""
-    now = now_kst()
-    end = now.replace(hour=WINDOW_START_HOUR_KST, minute=0, second=0, microsecond=0)
-    if now < end:
-        end -= dt.timedelta(days=1)
-    start = end - dt.timedelta(days=1)
-    return start, end
+def today_kst_str():
+    return now_kst().strftime("%Y-%m-%d")
 
 # ===============================
-# LOADERS
+# TEXT HELPERS
 # ===============================
-def load_queries_txt(path: str) -> List[str]:
+def strip_html(s: str) -> str:
+    s = s or ""
+    s = re.sub(r"(?is)<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def norm_title(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s가-힣]", "", s)
+    return s[:200]
+
+def domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+def fallback_3lines(title: str, rss_summary: str) -> str:
+    # RSS 요약이 너무 빈약/제목 반복이면 2~3줄 발췌로 대체
+    t = strip_html(rss_summary)
+    if not t or norm_title(t) == norm_title(title):
+        return ""
+    parts = re.split(r"(?<=[\.\!\?。！？])\s+|\s*\n\s*", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    return "<br/>".join(parts[:3])[:900]
+
+# ===============================
+# RISK / SCORE (간단 버전)
+# ===============================
+RISK_RULES = [
+    ("section 301", 6),
+    ("section 232", 6),
+    ("ieepa", 6),
+    ("export control", 6),
+    ("sanction", 6),
+    ("entity list", 5),
+    ("anti-dumping", 5),
+    ("countervailing", 5),
+    ("safeguard", 5),
+
+    ("tariff", 4),
+    ("duty", 4),
+    ("관세", 4),
+    ("관세율", 4),
+    ("추가관세", 4),
+
+    ("hs code", 3),
+    ("hs", 3),
+    ("원산지", 3),
+    ("fta", 3),
+    ("customs", 3),
+    ("통관", 3),
+
+    ("규정", 2),
+    ("시행", 2),
+    ("개정", 2),
+    ("고시", 2),
+]
+
+TRADE_KEYWORDS = [
+    "tariff", "duty", "customs", "hs", "section 232", "section 301", "ieepa",
+    "export control", "sanction", "origin", "fta", "anti-dumping", "countervailing",
+    "관세", "관세율", "통관", "원산지", "수출통제", "제재", "무역구제"
+]
+
+# TOP3 제외(비관련)
+NON_RELEVANT = [
+    "연예","스포츠","야구","축구","농구","테니스","골프","경기","우승",
+    "사망","추모","결혼","이혼","드라마","영화","배우",
+    "와인","wine","recipe","cook","cooking","맛집","여행","tour","festival"
+]
+
+def policy_score(title: str, summary: str, allowed_domains: set, link: str) -> int:
+    t = f"{title} {summary}".lower()
+    s = 1
+    for kw, w in RISK_RULES:
+        if kw in t:
+            s += w
+    # allowed domain bonus
+    d = domain_of(link)
+    if allowed_domains and d and d in allowed_domains:
+        s += 2
+    return min(s, 20)
+
+# ===============================
+# INPUT LOADER (TIGHT)
+# ===============================
+def load_custom_queries(path: str) -> list[str]:
     if not os.path.exists(path):
         return ["관세"]
     out = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            q = line.strip()
-            if not q:
+            x = line.strip()
+            if not x:
                 continue
-            if q.startswith("#"):
-                continue
-            out.append(q)
-    # de-dup preserve order
-    seen=set(); uniq=[]
+            out.append(x)
+    # 중복 제거(순서 유지)
+    seen = set()
+    uniq = []
     for q in out:
-        if q.lower() in seen: 
+        k = q.lower()
+        if k in seen:
             continue
-        seen.add(q.lower())
+        seen.add(k)
         uniq.append(q)
     return uniq or ["관세"]
 
 def _normalize_url(u: str) -> str:
-    if not u:
+    if u is None:
         return ""
     u = str(u).strip()
     if not u:
         return ""
-    # sometimes excel has non-string -> str already
     if not re.match(r"^https?://", u, flags=re.I):
+        # excel에서 url이 텍스트(이름)로 들어온 경우가 있어 방어
+        if " " in u and "." not in u:
+            return ""
         u = "https://" + u
     return u
 
-def _domain(u: str) -> str:
-    try:
-        return urlparse(u).netloc.lower()
-    except Exception:
-        return ""
-
-def load_sites_xlsx(path: str) -> Tuple[Dict[str,str], set]:
-    """Return domain_to_name, allowed_domains."""
+def load_sites_xlsx(path: str):
+    """
+    sites.xlsx expected:
+      - sheet: 'SiteList' (권장)  (예외적으로 'sites'도 허용)
+      - columns: name, url  (대소문자/공백 변형 허용)
+    return:
+      - domain_to_name: dict(domain -> name)
+      - allowed_domains: set(domains)
+    """
     if not os.path.exists(path):
         return {}, set()
 
     xls = pd.ExcelFile(path)
-    # accept common sheet names
-    sheet = None
-    for cand in ["SiteList", "sites", "Sites", "Sheet1"]:
-        if cand in xls.sheet_names:
-            sheet = cand
-            break
-    if sheet is None:
-        sheet = xls.sheet_names[0]
-
+    sheet = "SiteList" if "SiteList" in xls.sheet_names else ("sites" if "sites" in xls.sheet_names else xls.sheet_names[0])
     df = pd.read_excel(path, sheet_name=sheet)
-    df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # required columns: name, url (case-insensitive)
-    if "name" not in df.columns:
-        # try korean
-        for c in df.columns:
-            if "name" in c or "기관" in c or "사이트" in c:
-                df.rename(columns={c: "name"}, inplace=True)
-                break
-    if "url" not in df.columns:
-        for c in df.columns:
-            if "url" in c or "link" in c:
-                df.rename(columns={c: "url"}, inplace=True)
-                break
+    # column normalize
+    cols = {c: re.sub(r"\s+", "", str(c).strip().lower()) for c in df.columns}
+    name_col = None
+    url_col = None
+    for c, cc in cols.items():
+        if cc in ("name", "기관명", "사이트명"):
+            name_col = c
+        if cc in ("url", "link", "주소", "사이트url"):
+            url_col = c
+    if name_col is None or url_col is None:
+        # fallback: first two columns
+        name_col = df.columns[0]
+        url_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
 
-    if "name" not in df.columns or "url" not in df.columns:
-        raise ValueError(f"sites.xlsx must contain columns name,url (found: {list(df.columns)})")
+    df = df[[name_col, url_col]].copy()
+    df.columns = ["name", "url"]
+    df["name"] = df["name"].astype(str).str.strip()
+    df["url"] = df["url"].apply(_normalize_url)
 
-    domain_to_name: Dict[str,str] = {}
-    allowed_domains: set = set()
+    domain_to_name = {}
     for _, r in df.iterrows():
-        name = str(r.get("name","") or "").strip()
-        url = _normalize_url(r.get("url",""))
-        dom = _domain(url)
-        if not dom:
+        u = (r.get("url") or "").strip()
+        if not u:
             continue
-        if dom not in domain_to_name:
-            domain_to_name[dom] = name or dom
-        allowed_domains.add(dom)
+        d = domain_of(u)
+        if not d:
+            continue
+        domain_to_name[d] = str(r.get("name") or d).strip()
+
+    allowed_domains = set(domain_to_name.keys())
     return domain_to_name, allowed_domains
 
 # ===============================
-# RSS FETCH
+# MULTI-LANG GOOGLE NEWS RSS
 # ===============================
-LANG_PACK = [
-    # (lang_tag, extra_terms)
-    ("ko", ""),   # Korean
-    ("en", " tariff OR customs OR trade OR \"Section 232\" OR \"Section 301\" OR IEEPA OR \"Tariff Act\" OR \"trade expansion act\""),
-    ("fr", " tarif OR douane OR commerce OR \"section 232\" OR \"section 301\" OR sanctions"),
-    ("es", " arancel OR aduana OR comercio OR \"section 232\" OR \"section 301\" OR sanciones"),
+LANGS = [
+    ("ko", "KR", "KR:ko"),
+    ("en", "US", "US:en"),
+    ("fr", "FR", "FR:fr"),
 ]
 
-def build_rss_url(query: str, lang: str) -> str:
-    # Google News RSS search endpoint (language affects rendering)
-    extra = ""
-    for tag, terms in LANG_PACK:
-        if tag == lang:
-            extra = terms
-            break
-    q = query
-    if extra:
-        q = f'({query}) {extra}'
-    params = {
-        "q": q,
-        "hl": f"{lang}",
-        "gl": "KR" if lang=="ko" else "US",
-        "ceid": f"KR:ko" if lang=="ko" else "US:en",
-    }
-    return "https://news.google.com/rss/search?" + urlencode(params)
+def build_google_rss_url(query: str, hl: str, gl: str, ceid: str) -> str:
+    base = "https://news.google.com/rss/search?"
+    return base + urlencode({"q": query, "hl": hl, "gl": gl, "ceid": ceid})
 
-def strip_html(s: str) -> str:
-    s = s or ""
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = html.unescape(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def parse_published(e) -> str:
-    # keep original string; we will store as is (actions user asked to avoid wrong dates)
-    p = getattr(e, "published", "") or getattr(e, "updated", "") or ""
-    return str(p)
-
-def fetch_news(queries: List[str]) -> pd.DataFrame:
+def fetch_google_news(query: str, limit: int = 30) -> list[dict]:
     rows = []
-    for q in queries:
-        for lang in ["ko","en","fr","es"]:
-            rss = build_rss_url(q, lang)
-            feed = feedparser.parse(rss)
-            for e in feed.entries[:MAX_ITEMS_PER_QUERY]:
-                title = str(getattr(e,"title","") or "").strip()
-                link = str(getattr(e,"link","") or "").strip()
-                summ = strip_html(str(getattr(e,"summary","") or ""))
-                published = parse_published(e)
-                rows.append({
-                    "keyword": q,
-                    "lang": lang,
-                    "title": title,
-                    "link": link,
-                    "summary": summ[:1200],
-                    "published": published,
-                })
-    df = pd.DataFrame(rows)
-    return df
+    for hl, gl, ceid in LANGS:
+        rss = build_google_rss_url(query, hl, gl, ceid)
+        feed = feedparser.parse(rss)
+        for e in getattr(feed, "entries", [])[:limit]:
+            title = getattr(e, "title", "").strip()
+            link = getattr(e, "link", "").strip()
+            published = getattr(e, "published", "") or getattr(e, "updated", "")
+            summary = strip_html(getattr(e, "summary", "") or "")
+            rows.append({
+                "query": query,
+                "lang": hl,
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "published": published,
+            })
+    return rows
 
-# ===============================
-# SCORING / FILTERING
-# ===============================
-# hard triggers -> always show
-MUST_SHOW = [
-    "tariff act", "trade expansion act", "international emergency economic powers act",
-    "section 232", "section 301", "ieepa", "관세", "관세율"
-]
-TRADE_TERMS = [
-    "tariff","duty","customs","trade","import","export","hs","harmonized","origin","fta",
-    "sanction","export control","antidumping","anti-dumping","countervailing","safeguard",
-    "관세","통관","수입","수출","hs","원산지","fta","제재","수출통제","반덤핑","세이프가드"
-]
-NON_RELEVANT = [
-    # keep small but effective
-    "wine","wines","vino","vin","whisky","soccer","football","baseball","nba","k-pop","entertainment","celebrity",
-    "레시피","맛집","와인","축구","야구","연예"
-]
-
-PRODUCT_HINTS = [
-    "smartphone","mobile","phone","tablet","tv","monitor","refrigerator","air conditioner","network","5g","medical","x-ray",
-    "휴대폰","스마트폰","태블릿","tv","모니터","냉장고","에어컨","네트워크","5g","의료","엑스레이"
-]
-
-PROD_COUNTRIES = ["korea","china","vietnam","india","indonesia","turkey","türkiye","slovakia","poland","mexico","brazil",
-                  "한국","중국","베트남","인도","인도네시아","터키","슬로바키아","폴란드","멕시코","브라질"]
-
-def norm_title(t: str) -> str:
-    t = (t or "").lower().strip()
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"[\W_]+", " ", t)
-    return t.strip()
-
-def is_trade_related(title: str, summary: str) -> bool:
-    blob = f"{title} {summary}".lower()
-    if any(x in blob for x in MUST_SHOW):
-        return True
-    if any(x in blob for x in NON_RELEVANT):
-        # allow if MUST_SHOW hit
-        return False
-    return any(x in blob for x in TRADE_TERMS)
-
-def policy_score(title: str, summary: str, allowed_domains: set, link: str) -> int:
-    blob = f"{title} {summary}".lower()
-    score = 1
-    # high-impact
-    for kw,w in [
-        ("section 301",7),("section 232",7),("ieepa",7),
-        ("tariff act",7),("trade expansion act",7),("international emergency economic powers act",7),
-        ("export control",6),("sanction",6),("entity list",5),
-        ("anti-dumping",5),("antidumping",5),("countervailing",5),("safeguard",5),
-        ("관세율",6),("추가관세",6),("관세",5),("tariff",5),("duty",4),
-        ("hs",3),("harmonized",3),("원산지",3),("fta",3),("통관",3),("customs",3),
-    ]:
-        if kw in blob:
-            score += w
-    # product/country hints
-    if any(k in blob for k in PRODUCT_HINTS):
-        score += 2
-    if any(c in blob for c in PROD_COUNTRIES):
-        score += 1
-    # preferred sources bonus (official/approved list)
-    dom = _domain(link)
-    if dom and dom in allowed_domains:
-        score += 3
-    return min(score, 20)
-
-def dedup(df: pd.DataFrame) -> pd.DataFrame:
+def dedup_rows(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["t_norm"] = df["title"].map(norm_title)
-    df["dom"] = df["link"].map(_domain)
-    # key: title norm + domain
-    df["dedup_key"] = df["t_norm"] + "|" + df["dom"]
-    df = df.drop_duplicates(subset=["dedup_key"], keep="first")
+    df["k_title"] = df["title"].apply(norm_title)
+    df["k_link"] = df["link"].fillna("").astype(str).str.strip()
+    # title+domain 기준으로도 중복 제거
+    df["k_dom"] = df["link"].fillna("").astype(str).apply(domain_of)
+    df = df.drop_duplicates(subset=["query", "k_link"], keep="first")
+    df = df.drop_duplicates(subset=["query", "k_title", "k_dom"], keep="first")
+    df = df.drop(columns=["k_title","k_link","k_dom"], errors="ignore")
     return df
 
 # ===============================
-# GEMINI SUMMARY (OPTIONAL)
+# GEMINI + ARTICLE TEXT FETCH
 # ===============================
-def fallback_3lines(title: str, summary: str) -> str:
-    s = strip_html(summary or "")
-    if not s or norm_title(s) == norm_title(title):
-        s = strip_html(title or "")
-    if not s:
+def _http_get(url: str, timeout: int = 12) -> str:
+    """Lightweight HTTP GET with UA. Returns text or empty."""
+    if not url:
         return ""
-    parts = re.split(r"(?<=[\.\!\?。！？])\s+|\s*\n\s*", s)
+    try:
+        import requests  # type: ignore
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; customs-news-bot/1.0)"}
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if r.status_code >= 400:
+            return ""
+        r.encoding = r.apparent_encoding or r.encoding
+        return r.text or ""
+    except Exception:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; customs-news-bot/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                b = resp.read()
+            return b.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+def extract_article_text(html_text: str) -> str:
+    """Extract readable text from html; best-effort."""
+    if not html_text:
+        return ""
+    html_text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html_text)
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html_text, "html.parser")
+        main = soup.find("article") or soup.find("main") or soup.body
+        text = (main.get_text(" ", strip=True) if main else soup.get_text(" ", strip=True))
+    except Exception:
+        text = re.sub(r"(?is)<[^>]+>", " ", html_text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:6000]
+
+def fetch_article_text(url: str) -> str:
+    raw = _http_get(url)
+    return extract_article_text(raw)
+
+def pick_fallback_lines(title: str, rss_summary: str, article_text: str) -> str:
+    """Fallback when Gemini is unavailable: show 2~3 short lines."""
+    src = (article_text or "").strip() or strip_html(rss_summary).strip()
+    if not src:
+        return fallback_3lines(title, rss_summary)
+    src = re.sub(r"\s+", " ", src).strip()
+    if norm_title(src[:200]) == norm_title(title):
+        src = src[200:].strip()
+    parts = re.split(r"(?<=[\.\!\?。！？])\s+|\s*\n\s*", src)
     parts = [p.strip() for p in parts if p.strip()]
     return "<br/>".join(parts[:3])[:900]
 
 def gemini_client():
     import google.generativeai as genai  # type: ignore
     genai.configure(api_key=GEMINI_API_KEY)
-    return genai.GenerativeModel(GEMINI_MODEL)
+    return genai.GenerativeModel("gemini-1.5-flash")
 
-def ensure_korean_summaries(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_korean_summaries(df: pd.DataFrame, allowed_domains: set | None = None) -> pd.DataFrame:
+    """
+    df['summary_ko']를 '의미있는 한국어 요약'으로 보강합니다.
+    - GEMINI_ENABLED=1 & GEMINI_API_KEY 존재 시: Gemini로 강제 요약(제목+RSS요약+본문추출 기반)
+    - 그 외: 본문(가능 시) 또는 RSS요약에서 2~3줄 발췌
+    """
     df = df.copy()
     if "summary_ko" not in df.columns:
         df["summary_ko"] = ""
 
-    needs = []
-    for _, r in df.iterrows():
+    allowed_domains = allowed_domains or set()
+    max_calls = int(os.getenv("MAX_SUMMARY_CALLS", "20"))
+
+    def needs(r) -> bool:
         cur = str(r.get("summary_ko","") or "").strip()
         title = str(r.get("title","") or "")
-        if (not cur) or (norm_title(cur) == norm_title(title)) or (len(cur) < 40):
-            needs.append(True)
-        else:
-            needs.append(False)
+        return (not cur) or (norm_title(cur) == norm_title(title)) or (len(strip_html(cur)) < 40)
+
+    mask = df.apply(needs, axis=1)
+    if not mask.any():
+        return df
+
+    # 우선순위: 점수 높은 순
+    if "score" not in df.columns:
+        df["score"] = df.apply(lambda r: policy_score(str(r.get("title","")), str(r.get("summary","")), allowed_domains, str(r.get("link",""))), axis=1)
+
+    idxs = df.loc[mask].sort_values("score", ascending=False).index.tolist()
+    idxs_call = idxs[:max_calls]
 
     use_gemini = bool(GEMINI_ENABLED and GEMINI_API_KEY)
-    if not use_gemini:
-        df.loc[needs, "summary_ko"] = [
-            fallback_3lines(str(r.get("title","")), str(r.get("summary","")))
-            for _, r in df.loc[needs].iterrows()
-        ]
-        return df
-
-    # Gemini
-    try:
-        model = gemini_client()
-    except Exception:
-        df.loc[needs, "summary_ko"] = [
-            fallback_3lines(str(r.get("title","")), str(r.get("summary","")))
-            for _, r in df.loc[needs].iterrows()
-        ]
-        return df
-
-    out = []
-    for _, r in df.iterrows():
-        title = str(r.get("title","") or "")
-        summ = str(r.get("summary","") or "")
-        url = str(r.get("link","") or "")
-        if not ((not r.get("summary_ko","")) or (norm_title(str(r.get("summary_ko",""))) == norm_title(title)) or (len(str(r.get("summary_ko",""))) < 40)):
-            out.append(str(r.get("summary_ko","")))
-            continue
-        prompt = (
-            "아래 뉴스의 핵심 내용을 한국어로 2~3문장으로 요약해 주세요.\n"
-            "- 관세/관세율/HS/232/301/IEEPA/수출통제/제재/원산지/FTA/통관 관련 포인트가 있으면 반드시 포함\n"
-            "- 기업 관점에서 당사 영향(원가/마진/리드타임/공급망/수출입 리스크)을 1문장 포함\n"
-            "- 불릿/번호 없이 문장으로\n\n"
-            f"[제목] {title}\n"
-            f"[RSS요약] {summ}\n"
-            f"[URL] {url}\n"
-        )
+    model = None
+    if use_gemini:
         try:
-            resp = model.generate_content(prompt)
-            text = (getattr(resp, "text", "") or "").strip()
-            text = re.sub(r"\s+", " ", text)
-            if not text:
-                text = fallback_3lines(title, summ)
-            out.append(html.escape(text).replace("\n","<br/>")[:1000])
+            model = gemini_client()
         except Exception:
-            out.append(fallback_3lines(title, summ))
-    df["summary_ko"] = out
+            model = None
+            use_gemini = False
+
+    article_cache: dict[str, str] = {}
+
+    def get_article(url: str) -> str:
+        url = (url or "").strip()
+        if not url:
+            return ""
+        if url in article_cache:
+            return article_cache[url]
+        if allowed_domains:
+            d = domain_of(url)
+            if d and d not in allowed_domains:
+                article_cache[url] = ""
+                return ""
+        article_cache[url] = fetch_article_text(url)
+        return article_cache[url]
+
+    for i in idxs_call:
+        r = df.loc[i]
+        title = str(r.get("title","") or "")
+        rss_sum = str(r.get("summary","") or "")
+        url = str(r.get("link","") or "")
+        article = get_article(url)
+
+        if use_gemini and model is not None:
+            prompt = (
+                "당신은 삼성전자 관세/통상 담당자를 위한 요약 AI입니다.\n"
+                "아래 뉴스 내용을 한국어로 2~3문장 요약하세요.\n"
+                "규칙: (1) 관세/관세율/HS/232/301/IEEPA/수출통제/제재/원산지/FTA/통관 포인트가 있으면 포함\n"
+                "      (2) 당사 사업(모바일/가전/네트워크/의료기기) 관점 영향 1문장 포함\n"
+                "      (3) 제목을 그대로 반복하지 말 것\n"
+                "      (4) 불릿/번호 없이 문장으로\n\n"
+                f"[제목] {title}\n"
+                f"[RSS요약] {strip_html(rss_sum)}\n"
+                f"[본문발췌] {article[:2500]}\n"
+                f"[URL] {url}\n"
+            )
+            try:
+                resp = model.generate_content(prompt)
+                out = (getattr(resp, "text", "") or "").strip()
+                out = re.sub(r"\s+", " ", out).strip()
+                if (not out) or (norm_title(out) == norm_title(title)) or (len(out) < 35):
+                    out = pick_fallback_lines(title, rss_sum, article)
+                df.at[i, "summary_ko"] = out[:1000]
+                continue
+            except Exception:
+                pass
+
+        df.at[i, "summary_ko"] = pick_fallback_lines(title, rss_sum, article)
+
+    # 나머지는 RSS 기반 fallback
+    rest = [i for i in idxs if i not in idxs_call]
+    for i in rest:
+        df.at[i, "summary_ko"] = fallback_3lines(str(df.at[i, "title"]), str(df.at[i, "summary"]))
+
     return df
 
 # ===============================
-# TOP3 PICK + WHY/CHECKPOINT
+# TOP3 PICK
 # ===============================
+def ok_row(r, allowed_domains: set) -> bool:
+    title = str(r.get("title","") or "")
+    summ = str(r.get("summary","") or "")
+    blob = (title + " " + summ).lower()
+
+    # non-relevant
+    if any(x.lower() in blob for x in NON_RELEVANT):
+        return False
+
+    # must contain trade-ish keyword
+    if not any(k in blob for k in [k.lower() for k in TRADE_KEYWORDS]):
+        return False
+
+    # if allowed domains list exists, prefer those (not hard block)
+    return True
+
 def pick_top3(df: pd.DataFrame, allowed_domains: set) -> pd.DataFrame:
-    df = df.copy()
-    df = df[df.apply(lambda r: is_trade_related(str(r.get("title","")), str(r.get("summary",""))), axis=1)].copy()
     if df.empty:
         return df
-    df["score"] = df.apply(lambda r: policy_score(str(r["title"]), str(r["summary"]), allowed_domains, str(r["link"])), axis=1)
-    # exclude obvious non-relevant (e.g. wine) unless MUST_SHOW
-    def _keep(r):
-        blob = f"{r['title']} {r['summary']}".lower()
-        if any(x in blob for x in NON_RELEVANT) and not any(x in blob for x in MUST_SHOW):
-            return False
-        return True
-    df = df[df.apply(_keep, axis=1)].copy()
-    df = df.sort_values(["score"], ascending=False).head(3)
-    return df
 
-def build_why_and_checkpoint(top3: pd.DataFrame) -> Tuple[str,str]:
-    # de-dup by same country/product hint pattern
-    seen=set()
-    why_lines=[]
-    chk_lines=[]
-    for _, r in top3.iterrows():
-        title = str(r.get("title",""))
-        summ = strip_html(str(r.get("summary_ko","")) or str(r.get("summary","")))
-        blob = f"{title} {summ}".lower()
-        # infer impact tags
-        impact=[]
-        if any(k in blob for k in ["tariff","관세","관세율","duty","section 301","section 232","ieepa"]):
-            impact.append("원가/마진")
-        if any(k in blob for k in ["export control","수출통제","sanction","제재","entity list"]):
-            impact.append("수출입 제한/거래차질")
-        if any(k in blob for k in ["hs","harmonized","classification","품목분류"]):
-            impact.append("HS/분류 리스크")
-        if any(k in blob for k in ["origin","원산지","fta"]):
-            impact.append("FTA/원산지 리스크")
-        if not impact:
-            impact=["리스크 모니터링"]
+    cand = df.copy()
+    cand = cand[cand.apply(lambda r: ok_row(r, allowed_domains), axis=1)].copy()
 
-        key = "|".join(impact)
-        if key in seen:
-            continue
-        seen.add(key)
+    # 부족하면 점수순으로 채우기(단 non-relevant 제외)
+    if len(cand) < 3:
+        df2 = df.copy()
+        df2 = df2[~df2.apply(lambda r: any(x.lower() in (str(r.get("title",""))+" "+str(r.get("summary",""))).lower() for x in NON_RELEVANT), axis=1)].copy()
+        cand = pd.concat([cand, df2], ignore_index=True).drop_duplicates(subset=["link","title"], keep="first")
 
-        why_lines.append(f"• {', '.join(impact)} 관점에서 영향 가능 — 정책/집행 변화 시 비용·리드타임·컴플라이언스 리스크 확대")
-        chk_lines.append(
-            "• Action: ① 대상국/품목(HS)·적용시점 확인 → ② 생산/판매법인 영향(원가·마진·리드타임) 1차 산정 → ③ 필요 시 HQ 대응(관세전략/FTA/제재·수출통제) 착수"
-        )
-    return "<br/>".join(why_lines) or "• (TOP3가 충분히 산출되지 않아 금일은 모니터링만 수행)", "<br/>".join(chk_lines) or "• (TOP3가 충분히 산출되지 않아 금일은 모니터링만 수행)"
+    cand = cand.sort_values("score", ascending=False).head(3)
+    return cand
 
 # ===============================
-# TABLE BUILD (A4 Landscape)
+# OUTPUT TABLE (제시어별 10건 제한)
 # ===============================
-STYLE = """
-<style>
-@page { size: A4 landscape; margin: 10mm; }
-body{font-family:Malgun Gothic,Arial; background:#f6f6f6; margin:0;}
-.page{max-width:297mm;margin:auto;background:white;padding:10mm;}
-h2{margin:0 0 6px 0;}
-.box{border:1px solid #ddd;border-radius:10px;padding:10px;margin:10px 0;}
-.small{font-size:11px;color:#555;}
-table{border-collapse:collapse;width:100%; table-layout:fixed;}
-th,td{border:1px solid #ccc;padding:6px;font-size:11px;vertical-align:top;word-wrap:break-word;}
-th{background:#f0f0f0;}
-.col-k{width:10%;}
-.col-c{width:8%;}
-.col-d{width:14%;}
-.col-a{width:12%;}
-.col-s{width:56%;}
-</style>
-"""
-
-def org_from_domain(domain_to_name: Dict[str,str], link: str) -> str:
-    dom = _domain(link)
-    return domain_to_name.get(dom, "")
-
-def keyword_counts_line(df: pd.DataFrame) -> str:
-    vc = df["keyword"].value_counts()
-    parts = [f"{k} {int(v)}건" for k,v in vc.items()]
-    return ", ".join(parts)
-
-def build_table(df: pd.DataFrame, domain_to_name: Dict[str,str]) -> str:
-    # sort: keyword asc, importance asc (상->중->하) so map
-    imp_rank = {"상":0, "중":1, "하":2}
+def build_table(df: pd.DataFrame) -> str:
+    # 제시어별 10건 제한 + 정렬(제시어, 중요도/점수)
     df = df.copy()
-    df["importance"] = df.get("importance", "중")
-    df["imp_r"] = df["importance"].map(imp_rank).fillna(1).astype(int)
 
-    # per keyword keep top N after dedup
-    out_rows=[]
-    for kw, g in df.groupby("keyword", sort=True):
-        g = g.sort_values(["score","published"], ascending=[False, False]).head(MAX_TABLE_PER_KEYWORD)
-        out_rows.append(g)
-    df2 = pd.concat(out_rows, ignore_index=True) if out_rows else df.head(0)
+    # 중요도 표시
+    def importance(score: int) -> str:
+        if score >= 10:
+            return "상"
+        if score >= 6:
+            return "중"
+        return "하"
+    df["중요도"] = df["score"].apply(lambda x: importance(int(x)))
 
-    df2 = df2.sort_values(["keyword","imp_r","score"], ascending=[True,True,False])
+    # 제시어별 상위 10개
+    df = df.sort_values(["query", "score"], ascending=[True, False])
+    df = df.groupby("query", as_index=False).head(10).copy()
 
-    rows_html=""
-    for _, r in df2.iterrows():
-        kw = html.escape(str(r.get("keyword","")))
-        imp = html.escape(str(r.get("importance","중")))
-        date = html.escape(str(r.get("published","")))
-        org = html.escape(org_from_domain(domain_to_name, str(r.get("link",""))))
-        title = html.escape(str(r.get("title","")))
-        summ = str(r.get("summary_ko","") or "")
-        if not summ:
-            summ = fallback_3lines(str(r.get("title","")), str(r.get("summary","")))
-        link = html.escape(str(r.get("link","")))
-        cell = f'<a href="{link}" target="_blank">{title}</a><br/><span class="small">{summ}</span>'
-        rows_html += f"""
+    # 제시어별 건수 라인
+    counts = df.groupby("query").size().to_dict()
+    counts_line = ", ".join([f"{k} {v}건" for k, v in counts.items()])
+
+    rows = []
+    for _, r in df.iterrows():
+        title = html.escape(str(r.get("title","") or ""))
+        url = str(r.get("link","") or "#")
+        summ_ko = str(r.get("summary_ko","") or "").strip()
+        if not summ_ko:
+            summ_ko = fallback_3lines(str(r.get("title","")), str(r.get("summary","")))
+        summ_ko = summ_ko.replace("\n","<br/>")
+        pub = html.escape(str(r.get("published","") or ""))
+        q = html.escape(str(r.get("query","") or ""))
+        imp = html.escape(str(r.get("중요도","") or ""))
+
+        rows.append(f"""
         <tr>
-          <td class="col-k">{kw}</td>
-          <td class="col-c">{imp}</td>
-          <td class="col-d">{date}</td>
-          <td class="col-a">{org}</td>
-          <td class="col-s">{cell}</td>
+          <td style="width:88px;white-space:nowrap;">{q}<br/><span class="small">({imp})</span></td>
+          <td>
+            <a href="{url}" target="_blank">{title}</a><br/>
+            <span class="small">{summ_ko}</span>
+          </td>
+          <td style="width:140px;">{pub}</td>
+          <td style="width:70px;">점수 {int(r.get("score",0))}</td>
         </tr>
-        """
-    return f"""
+        """)
+
+    table = f"""
     <div class="box">
       <h3>④ 정책 이벤트 표</h3>
-      <div class="small">{html.escape(keyword_counts_line(df2) if not df2.empty else "표시할 항목이 없습니다")}</div>
+      <div class="small" style="margin:6px 0 10px 0;">제시어별 주요뉴스 건수: {html.escape(counts_line)}</div>
       <table>
         <tr>
-          <th class="col-k">제시어</th>
-          <th class="col-c">중요도</th>
-          <th class="col-d">발표일</th>
-          <th class="col-a">관련기관</th>
-          <th class="col-s">헤드라인 / 주요내용</th>
+          <th style="width:88px;">제시어(중요도)</th>
+          <th>헤드라인 / 주요내용</th>
+          <th style="width:140px;">발표일</th>
+          <th style="width:70px;">비고</th>
         </tr>
-        {rows_html}
+        {''.join(rows)}
       </table>
     </div>
     """
+    return table
 
 # ===============================
-# HTML BUILD (shared blocks)
+# HTML STYLE (A4 Landscape 느낌)
 # ===============================
-def build_top3_html(top3: pd.DataFrame) -> str:
-    if top3.empty:
-        return "<div class='small'>TOP3 산출 없음 (금일 수집 결과가 조건에 부합하지 않음)</div>"
-    items=""
+STYLE = """
+<style>
+body{font-family:Malgun Gothic,Arial; background:#f6f6f6;}
+.page{max-width:1120px;margin:auto;background:white;padding:14px;}
+h2{margin-bottom:6px;}
+.box{border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0;}
+li{margin-bottom:12px;}
+table{border-collapse:collapse;width:100%;}
+th,td{border:1px solid #ccc;padding:7px;font-size:12px;vertical-align:top;}
+th{background:#f0f0f0;}
+.small{font-size:11px;color:#555;line-height:1.35;}
+</style>
+"""
+
+def build_top3_blocks(top3: pd.DataFrame) -> tuple[str,str,str]:
+    items = []
+    why = []
+    chk = []
+
     for _, r in top3.iterrows():
-        title = html.escape(str(r.get("title","")))
-        link = html.escape(str(r.get("link","")))
-        summ = str(r.get("summary_ko","") or "")
-        if not summ:
-            summ = fallback_3lines(str(r.get("title","")), str(r.get("summary","")))
-        items += f"""
-        <li>
-          <a href="{link}" target="_blank"><b>{title}</b></a><br/>
-          <span class="small">{summ}</span>
-        </li>
-        """
-    return f"<ul>{items}</ul>"
+        title = html.escape(str(r.get("title","") or ""))
+        url = str(r.get("link","") or "#")
+        summ_ko = str(r.get("summary_ko","") or "").strip()
+        if not summ_ko:
+            summ_ko = fallback_3lines(str(r.get("title","")), str(r.get("summary","")))
+        if not summ_ko:
+            # 최후: 제목만 나오지 않게 방어
+            summ_ko = "요약 생성 실패(본문 접근 제한). 원문 링크를 확인해 주세요."
+        score = int(r.get("score", 0))
+        q = str(r.get("query","") or "")
 
-def build_html_common(top3: pd.DataFrame, why_html: str, chk_html: str, title_prefix: str) -> str:
-    date = now_kst().strftime("%Y-%m-%d")
-    start, end = window_kst()
-    win = f"{start.strftime('%m/%d %H:%M')}~{end.strftime('%m/%d %H:%M')} (KST)"
+        items.append(f"""
+        <li>
+          <b>[{html.escape(q)} | 점수 {score}]</b><br/>
+          <a href="{url}" target="_blank">{title}</a><br/>
+          <div class="small">{summ_ko}</div>
+        </li>
+        """)
+
+        # 중복 문구 방지: 이벤트별 1줄만
+        why.append(f"<li><b>{html.escape(q)}</b>: 관세/통상 규제 변화 가능 → 원가/마진/리드타임/공급망 리스크로 연결될 수 있음</li>")
+        chk.append(f"<li><b>{html.escape(q)}</b>: (1) 대상국/품목(HS) 확인 (2) 생산지/판매법인 영향(원가·마진·리드타임) 1차 산정 (3) 필요 시 HQ 대응 착수</li>")
+
+    return "".join(items), "".join(why), "".join(chk)
+
+def build_html_exec(df: pd.DataFrame, top3: pd.DataFrame) -> str:
+    date = today_kst_str()
+    items_html, why_html, chk_html = build_top3_blocks(top3)
+
     return f"""
     <html><head>{STYLE}</head>
     <body><div class="page">
-      <h2>{title_prefix} 관세·통상 데일리 브리프 ({date})</h2>
-      <div class="small">수집 구간: {win} / 제시어: {html.escape(', '.join(top3['keyword'].unique().tolist()) if not top3.empty else '')}</div>
+      <h2>[Executive] 관세·통상 핵심 TOP3 ({date})</h2>
 
       <div class="box">
         <h3>① 관세·통상 핵심 TOP3</h3>
-        {build_top3_html(top3)}
+        <ul>{items_html}</ul>
       </div>
 
       <div class="box">
-        <h3>② 왜 중요한가 (TOP3 기반)</h3>
-        <div class="small">{why_html}</div>
+        <h3>② 왜 중요한가 (TOP3 이벤트 기반)</h3>
+        <ul>{why_html}</ul>
       </div>
 
       <div class="box">
-        <h3>③ 당사 관점 체크포인트 (TOP3 기반)</h3>
-        <div class="small">{chk_html}</div>
+        <h3>③ 당사 관점 체크포인트 (TOP3 이벤트 기반)</h3>
+        <ul>{chk_html}</ul>
       </div>
+
     </div></body></html>
     """
 
-def build_html_exec(top3: pd.DataFrame, why_html: str, chk_html: str) -> str:
-    return build_html_common(top3, why_html, chk_html, "[Executive]")
+def build_html_practitioner(df: pd.DataFrame, top3: pd.DataFrame) -> str:
+    date = today_kst_str()
+    items_html, why_html, chk_html = build_top3_blocks(top3)
+    table = build_table(df)
 
-def build_html_practitioner(top3: pd.DataFrame, why_html: str, chk_html: str, table_html: str) -> str:
-    base = build_html_common(top3, why_html, chk_html, "")
-    # insert table before closing
-    return base.replace("</div></body></html>", table_html + "</div></body></html>")
+    return f"""
+    <html><head>{STYLE}</head>
+    <body><div class="page">
+      <h2>관세·무역 뉴스 브리핑 ({date})</h2>
+
+      <div class="box">
+        <h3>① 오늘의 핵심 정책 이벤트 TOP3</h3>
+        <ul>{items_html}</ul>
+      </div>
+
+      <div class="box">
+        <h3>② 왜 중요한가 (TOP3 이벤트 기반)</h3>
+        <ul>{why_html}</ul>
+      </div>
+
+      <div class="box">
+        <h3>③ 당사 관점 체크포인트 (TOP3 이벤트 기반)</h3>
+        <ul>{chk_html}</ul>
+      </div>
+
+      {table}
+
+    </div></body></html>
+    """
 
 # ===============================
-# OUTPUTS + MAIL
+# OUTPUTS
 # ===============================
-def write_outputs(df: pd.DataFrame, html_body: str) -> Tuple[str,str,str]:
-    today = now_kst().strftime("%Y-%m-%d")
+def write_outputs(df: pd.DataFrame, html_body: str):
+    today = today_kst_str()
     csv_path  = os.path.join(BASE_DIR, f"policy_events_{today}.csv")
     xlsx_path = os.path.join(BASE_DIR, f"policy_events_{today}.xlsx")
     html_path = os.path.join(BASE_DIR, f"policy_events_{today}.html")
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    try:
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    except TypeError:
+        df.to_csv(csv_path, index=False)
+
     df.to_excel(xlsx_path, index=False)
+
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_body)
+
     return csv_path, xlsx_path, html_path
 
-def send_mail_to(recipients: List[str], subject: str, html_body: str) -> None:
+# ===============================
+# MAIL
+# ===============================
+def send_mail_to(recipients, subject, html_body):
     if not recipients:
-        print("[WARN] recipients empty -> skip sending:", subject)
         return
-    if not (SMTP_SERVER and SMTP_EMAIL and SMTP_PASSWORD):
-        print("[WARN] SMTP env missing -> skip sending")
-        return
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = SMTP_EMAIL
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
+
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
         s.starttls()
-        s.login(SMTP_EMAIL, SMTP_PASSWORD)
+        if SMTP_EMAIL and SMTP_PASSWORD:
+            s.login(SMTP_EMAIL, SMTP_PASSWORD)
         s.sendmail(SMTP_EMAIL, recipients, msg.as_string())
 
 # ===============================
 # MAIN
 # ===============================
 def main():
-    print("BASE_DIR =", BASE_DIR)
-    print("CUSTOM_QUERIES_FILE =", CUSTOM_QUERIES_FILE)
-    print("SITES_FILE =", SITES_FILE)
-    print("GEMINI_ENABLED =", GEMINI_ENABLED)
-    start, end = window_kst()
-    print("WINDOW_KST =", start, "~", end)
+    print("[INFO] BASE_DIR =", BASE_DIR)
+    print("[INFO] CUSTOM_QUERIES_FILE =", CUSTOM_QUERIES_FILE)
+    print("[INFO] SITES_FILE =", SITES_FILE)
+    print("[INFO] GEMINI_ENABLED =", GEMINI_ENABLED, "| GEMINI_API_KEY set =", bool(GEMINI_API_KEY))
 
-    queries = load_queries_txt(CUSTOM_QUERIES_FILE)
     domain_to_name, allowed_domains = load_sites_xlsx(SITES_FILE)
     print(f"[INFO] sites.xlsx loaded: domains={len(allowed_domains)}")
 
-    df = fetch_news(queries)
+    queries = load_custom_queries(CUSTOM_QUERIES_FILE)
+    print(f"[INFO] custom queries loaded: {len(queries)}")
+
+    all_rows = []
+    for q in queries:
+        rows = fetch_google_news(q, limit=30)
+        all_rows.extend(rows)
+
+    df = pd.DataFrame(all_rows)
     if df.empty:
-        print("No RSS entries.")
+        print("오늘 수집된 이벤트/뉴스 없음")
         return
 
-    # trade filter first
-    df = df[df.apply(lambda r: is_trade_related(str(r["title"]), str(r["summary"])), axis=1)].copy()
-    if df.empty:
-        print("No trade-related entries after filter.")
-        return
+    df = dedup_rows(df)
+    df["score"] = df.apply(lambda r: policy_score(str(r.get("title","")), str(r.get("summary","")), allowed_domains, str(r.get("link",""))), axis=1)
 
-    df = dedup(df)
-    df["score"] = df.apply(lambda r: policy_score(str(r["title"]), str(r["summary"]), allowed_domains, str(r["link"])), axis=1)
+    # ✅ 요약 보강(Gemini 강제 + 실패 시 본문 2~3줄)
+    df = ensure_korean_summaries(df, allowed_domains)
 
-    # importance mapping
-    df["importance"] = df["score"].apply(lambda s: "상" if s>=15 else ("중" if s>=8 else "하"))
-
-    # summaries
-    df = ensure_korean_summaries(df)
-
-    # top3
+    # TOP3
     top3 = pick_top3(df, allowed_domains)
-    why_html, chk_html = build_why_and_checkpoint(top3)
 
-    # emails
-    today = now_kst().strftime("%Y-%m-%d")
-    exec_html = build_html_exec(top3, why_html, chk_html)
+    # 메일 HTML
+    html_exec = build_html_exec(df, top3)
+    html_prac = build_html_practitioner(df, top3)
 
-    table_html = build_table(df, domain_to_name)
-    prac_html = build_html_practitioner(top3, why_html, chk_html, table_html)
+    # outputs는 실무자용(표 포함) 기준 저장
+    write_outputs(df, html_prac)
 
-    # outputs: store practitioner HTML as file
-    write_outputs(df, prac_html)
+    today = today_kst_str()
+    send_mail_to(RECIPIENTS, f"관세·무역 뉴스 브리핑 ({today})", html_prac)
+    send_mail_to(RECIPIENTS_EXEC, f"[Executive] 관세·통상 핵심 TOP3 ({today})", html_exec)
 
-    # send (exec/prac content same except table)
-    send_mail_to(RECIPIENTS_EXEC, f"[Executive] 관세·통상 데일리 브리프 ({today})", exec_html)
-    send_mail_to(RECIPIENTS,      f"관세·통상 데일리 브리프 ({today})", prac_html)
-
-    print("✅ DONE")
+    print("✅ DONE: mail sent + outputs written")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        traceback.print_exc()
-        raise
+    main()
