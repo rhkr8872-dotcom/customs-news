@@ -2,13 +2,13 @@ name: daily-customs-brief
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00 (메일 발송)
+    # 08:00 KST = 23:00 UTC (previous day)
+    - cron: "0 23 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +34,8 @@ jobs:
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
           RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_ENABLED: "1"
+          GEMINI_MODEL: "gemini-1.5-flash"
           BASE_DIR: ${{ github.workspace }}/out
           CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
           SITES_FILE: ${{ github.workspace }}/sites.xlsx
@@ -45,5 +47,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: outputs-${{ github.run_id }}
-          path: out/**
-          if-no-files-found: ignore
+          path: out
+
+      - name: Commit & push outputs to repo
+        run: |
+          git config user.name "actions-user"
+          git config user.email "actions@users.noreply.github.com"
+          git add out || true
+          git commit -m "Daily outputs: $(date -u +%Y-%m-%d)" || echo "No changes"
+          git push
