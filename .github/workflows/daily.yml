@@ -38,6 +38,7 @@ jobs:
           CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
           SITES_FILE: ${{ github.workspace }}/sites.xlsx
           WINDOW_START_HOUR_KST: "7"
+          GEMINI_ENABLED: "1"
         run: |
           python daily_brief.py
 
