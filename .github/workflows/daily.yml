@@ -2,7 +2,8 @@ name: daily-customs-brief
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # UTC 23:00 = KST 08:00 (메일 발송)
+    # KST 08:00 = UTC 23:00
+    - cron: "0 23 * * *"
   workflow_dispatch:
 
 jobs:
@@ -25,20 +26,40 @@ jobs:
         run: |
           mkdir -p out
 
+      - name: Debug flags (safe)
+        env:
+          GEMINI_ENABLED: ${{ secrets.GEMINI_ENABLED }}
+        run: |
+          echo "GEMINI_ENABLED=${GEMINI_ENABLED}"
+          echo "Runner UTC now: $(date -u)"
+          echo "Runner local now: $(date)"
+
       - name: Run script
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
           RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
+
+          # Gemini (키는 절대 echo 금지)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_ENABLED: ${{ secrets.GEMINI_ENABLED }}
+
+          # Files
           BASE_DIR: ${{ github.workspace }}/out
           CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
           SITES_FILE: ${{ github.workspace }}/sites.xlsx
+
+          # Time window: 07~07 (KST 기준)
           WINDOW_START_HOUR_KST: "7"
-          GEMINI_ENABLED: "1"
+          WINDOW_END_HOUR_KST: "7"
+
+          # Optional: mail run time (스크립트가 사용한다면)
+          SEND_HOUR_KST: "8"
+
         run: |
           python daily_brief.py
 
