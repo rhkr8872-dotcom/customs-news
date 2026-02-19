@@ -1,13 +1,20 @@
-name: Daily Trade Report
+name: Daily Trade Monitor
 on:
   schedule:
-    - cron: '0 0 * * *' # 매일 한국 시간 오전 9시 실행
+    - cron: '0 0 * * *' # UTC 기준 00:00 (한국 시간 오전 9시)
 jobs:
-  build:
+  run-script:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Run Script
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install pandas requests google-genai
+      - name: Run Monitoring Script
         env:
-          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
-        run: python your_script.py
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+        run: python main.py
