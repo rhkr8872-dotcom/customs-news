@@ -1,0 +1,13 @@
+name: Daily Trade Report
+on:
+  schedule:
+    - cron: '0 0 * * *' # 매일 한국 시간 오전 9시 실행
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run Script
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+        run: python your_script.py
