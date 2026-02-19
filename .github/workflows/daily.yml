@@ -40,6 +40,8 @@ jobs:
           CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
           SITES_FILE: ${{ github.workspace }}/sites.xlsx
           WINDOW_START_HOUR_KST: "7"
+          NEWS_LOOKBACK_HOURS: "24"
+          MAX_ITEMS_PER_QUERY: "10"
         run: |
           python daily_brief.py
 
