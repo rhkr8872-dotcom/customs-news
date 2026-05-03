@@ -2,7 +2,7 @@ name: daily-customs-brief
 
 on:
   schedule:
-    # 08:00 KST = 23:00 UTC (previous day)
+    # 07:00 KST = 22:00 UTC (previous day)
     - cron: "0 23 * * *"
   workflow_dispatch:
 
