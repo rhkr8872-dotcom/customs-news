@@ -21,6 +21,7 @@ Search period:
 - HOURS_BACK = 72
 """
 
+import json
 import os
 import re
 import time
@@ -48,7 +49,7 @@ except Exception:
     SELENIUM_AVAILABLE = False
 
 
-BASE_DIR = Path(r"C:\temp")
+BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\temp"))
 SITE_FILE = BASE_DIR / "sites.xlsx"
 
 OUT_ALL_FILE = BASE_DIR / "1.site_news_raw.xlsx"
@@ -56,6 +57,7 @@ OUT_AUDIT_FILE = BASE_DIR / "1.site_news_audit.xlsx"
 OUT_REG_FILE = BASE_DIR / "1-1.regulation_raw.xlsx"
 REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
 FINAL_EXCLUDED_FILE = BASE_DIR / "1.site_news_final_excluded.xlsx"
+POLICY_CANDIDATES_FILE = BASE_DIR / "1.site_policy_candidates.xlsx"
 CRAWL_HEALTH_FILE = BASE_DIR / "1.site_crawl_health.xlsx"
 
 HOURS_BACK = max(24, int(os.getenv("GTI_REGULATION_HOURS_BACK", "72")))
@@ -367,6 +369,10 @@ def is_menu_or_category_link(title, url, source=""):
     url_l = str(url or "").lower()
     source_l = str(source or "").lower()
 
+    # USTR articles live below /about/.../press-releases/; /about/ alone is
+    # normally navigational, but a concrete press-release detail URL is not.
+    is_ustr_press_detail = "/press-releases/" in url_l and url_l != source_l
+
     if not title:
         return True
     if low.startswith(("http://", "https://", "www.")):
@@ -439,14 +445,142 @@ def is_menu_or_category_link(title, url, source=""):
         "/ftamain/trade/",
         "/ftamain/promo/mag/",
         "/news/mediarusources/",
+        "/statistics/statistics",
+        "/legislation/laws",
+        "/service/",
+        "/statics/report/",
+        "/eu-trade-relationships-country-and-region",
+        "/help-exporters-and-importers",
+        "/national-customs-administrations",
+        "/customs/customs-procedures-import-and-export",
+        "/pt-br/servicos/",
+        "/pt-br/assuntos/aduana/",
     ]
-    if any(x in url_l for x in menu_url_parts):
+    if any(x in url_l for x in menu_url_parts) and not is_ustr_press_detail:
         return True
 
     if url_l == source_l:
         return True
 
     return False
+
+
+def has_title_date_conflict(title, dt):
+    """Reject a rescued page date when the title clearly identifies an older period."""
+    if dt is None:
+        return False
+    years = {int(x) for x in re.findall(r"(?<!\d)(20\d{2})(?!\d)", clean_text(title))}
+    if not years or dt.year in years:
+        return False
+    return max(years) < dt.year - 1
+
+
+def has_stale_explicit_title_year(title, reference=None):
+    """A no-date item cannot become an urgent candidate when its title is clearly historical."""
+    reference = reference or datetime.now()
+    years = {int(x) for x in re.findall(r"(?<!\d)(20\d{2})(?!\d)", clean_text(title))}
+    return bool(years) and max(years) < reference.year - 1
+
+
+def extract_official_url_date(url):
+    """Extract dates only from stable date-bearing official document URL patterns."""
+    value = str(url or "")
+    patterns = [
+        # Federal Register: /documents/2026/10/08/...
+        r"/documents/(20\d{2})/(\d{1,2})/(\d{1,2})/",
+        # METI legacy: /english/press/2024/0827_003.html
+        r"/press/(20\d{2})/(\d{2})(\d{2})(?:[_./-]|$)",
+        # METI current: /english/press/2026/10/20261008002.html
+        r"/press/20\d{2}/\d{1,2}/(20\d{2})(\d{2})(\d{2})\d*\.html",
+        # Japan MOF notices: ka20260804_e.html, ka20260724-2_e.html
+        r"(?:^|/)[a-z]*?(20\d{2})(\d{2})(\d{2})(?:[-_][^/]*)?\.html",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, value, re.I)
+        if not match:
+            continue
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            continue
+    return None
+
+
+def has_url_date_conflict(url, dt):
+    """Block a listing date copied onto an official document with another URL date."""
+    if dt is None:
+        return False
+    url_date = extract_official_url_date(url)
+    if url_date is None:
+        return False
+    return url_date != dt.date() or url_date > datetime.now().date()
+
+
+def has_stale_official_url_date(url, reference=None):
+    """Do not escalate an undated document when its official URL proves it is old."""
+    url_date = extract_official_url_date(url)
+    if url_date is None:
+        return False
+    reference = reference or datetime.now()
+    days_back = max(0, int(OVERSEAS_HOURS_BACK // 24))
+    return url_date < (reference.date() - timedelta(days=days_back))
+
+
+def is_policy_content_candidate(title):
+    """Keep policy/change signals; preserve the rest in excluded/audit workbooks."""
+    text = clean_text(title)
+    if not text:
+        return False
+    non_policy = re.compile(
+        r"training|course|seminar|workshop|summit|conference|webinar|tender|"
+        r"award|charity|donation|ceremony|inaugurat|statistics?|trade figures?|"
+        r"sơ bộ tình hình|khánh thành|bàn giao|đào tạo|hội nghị|hội thảo|"
+        r"laudo pericial|coverage of|community portal",
+        re.I,
+    )
+    if non_policy.search(text):
+        return False
+    enforcement_news = re.compile(
+        r"border patrol|coast guard|cocaine|meth(?:amphetamine)?|marijuana|"
+        r"seiz(?:e|ed|ure)|smuggl|maritime border crossing|recruiting event",
+        re.I,
+    )
+    if enforcement_news.search(text):
+        return False
+    section_337_case = (
+        re.match(r"certain\s+", text, re.I)
+        and re.search(r"investigation|commission determination|initial determination|section 337", text, re.I)
+        and not re.search(r"anti[- ]?dumping|countervailing|customs duty|tariff|five[- ]year review", text, re.I)
+    )
+    if section_337_case:
+        return False
+    # Pure tax-administration/VAT items are outside the customs-policy radar.
+    # Keep them only when the title also carries a customs/trade-border signal.
+    tax_only = re.search(r"\bvat\b|tax administration|tax fraud|tax jurisdiction", text, re.I)
+    customs_scope = re.search(
+        r"customs|tariff|dut(?:y|ies)|import|export|border|cbam|origin|trade remedy|"
+        r"관세|통관|수입|수출|원산지|세관|"
+        r"hải quan|xuất khẩu|nhập khẩu|thuế quan",
+        text,
+        re.I,
+    )
+    if tax_only and not customs_scope:
+        return False
+    policy_change = re.compile(
+        r"tariff|customs reform|customs procedure|customs duty|import duty|export duty|"
+        r"handling fee|customs guidance|"
+        r"anti[- ]?dumping|countervailing|safeguard|rules? of origin|"
+        r"tariff.rate quota|\btrq\b|quota|allocation of quantity|"
+        r"five[- ]year reviews?|institution of .*reviews?|determinations?|"
+        r"regulation|directive|implementing act|amend(?:ment|ed|s)?|adopt(?:ed|s)?|"
+        r"propos(?:al|es|ed)|consultation|notice|order|decree|law|legal text|"
+        r"관세|통관|원산지|수출통제|무역구제|덤핑|상계|세이프가드|고시|공고|"
+        r"규정|개정|제정|시행|입법|행정예고|"
+        r"quy định|thủ tục|nghị định|thông tư|sửa đổi|ban hành|phân cấp|"
+        r"gia công|sản xuất xuất khẩu|cửa quốc gia|phòng vệ thương mại",
+        re.I,
+    )
+    return bool(policy_change.search(text))
 
 
 def add_reject(reason, date_value, title, url, source, agency, site_type=""):
@@ -462,10 +596,7 @@ def add_reject(reason, date_value, title, url, source, agency, site_type=""):
     })
 
 
-def add_result(
-    date_value, title, url, source, agency, site_type, freshness_days=None,
-    date_source="", date_confidence="VERIFIED",
-):
+def add_result(date_value, title, url, source, agency, site_type, freshness_days=None):
     title = clean_text(title)
     url = str(url or "").strip()
     source = str(source or "").strip()
@@ -483,6 +614,10 @@ def add_result(
     dt = normalize_date(date_value)
     if dt is None:
         dt = extract_date_from_text(str(date_value))
+
+    if has_title_date_conflict(title, dt):
+        add_reject("title_date_conflict", date_value, title, url, source, agency, site_type)
+        dt = None
 
     if dt is None:
         date_out = ""
@@ -509,32 +644,35 @@ def add_result(
         "agency": agency,
         "site_type": site_type,
         "date_status": date_status,
-        "date_source": clean_text(date_source),
-        "date_confidence": clean_text(date_confidence) or "VERIFIED",
     })
     return True
 
 
-def fetch_html(url):
-    try:
-        r = requests.get(
-            url,
-            headers={
+def fetch_html(url, attempts=3):
+    """Fetch an official page without turning a transient failure into NO_NEW."""
+    headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
                 ),
                 "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-            timeout=25,
-        )
-        if r.status_code >= 400:
-            return None
-        r.encoding = r.apparent_encoding or r.encoding
-        return r
-    except Exception:
-        return None
+                "Cache-Control": "no-cache",
+            }
+    session = requests.Session()
+    for attempt in range(max(1, int(attempts))):
+        try:
+            r = session.get(url, headers=headers, timeout=(12, 35), allow_redirects=True)
+            if r.status_code < 400 and (r.text or "").strip():
+                r.encoding = r.apparent_encoding or r.encoding
+                return r
+            if r.status_code not in {403, 408, 425, 429, 500, 502, 503, 504}:
+                return None
+        except requests.RequestException:
+            pass
+        if attempt + 1 < max(1, int(attempts)):
+            time.sleep(1.5 * (attempt + 1))
+    return None
 
 
 def diagnose_zero_yield(url, site_recent_dt=None):
@@ -814,7 +952,15 @@ def detail_page_date(url):
         dt = normalize_date(time_tag.get("datetime")) or extract_date_from_text(time_tag.get_text(" ", strip=True))
         if dt:
             return dt
-    return extract_date_from_text(soup.get_text(" ", strip=True)[:8000])
+    # Navigation, footer and related-content dates must not become the article date.
+    for selector in [
+        "[class*='publish']", "[class*='date']", "[id*='publish']", "[id*='date']",
+    ]:
+        for tag in soup.select(selector)[:8]:
+            dt = extract_date_from_text(tag.get_text(" ", strip=True))
+            if dt:
+                return dt
+    return None
 
 
 def crawl_resilient_new_posts(source_url, agency, site_type):
@@ -1431,18 +1577,66 @@ def crawl_ustr(source_url, agency, site_type):
     return len(results) - before
 
 
+def extract_wto_url_date(url):
+    """Read the publication date encoded in WTO news-detail filenames."""
+    match = re.search(
+        r"_(\d{1,2})(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(\d{2})_",
+        str(url or ""),
+        re.I,
+    )
+    if not match:
+        return None
+    months = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    try:
+        return datetime(2000 + int(match.group(3)), months[match.group(2).lower()], int(match.group(1)))
+    except ValueError:
+        return None
+
+
+def parse_wto_news_page(html, source_url, agency, site_type):
+    """Extract concrete WTO news detail links, excluding navigation labels."""
+    before = len(results)
+    soup = BeautifulSoup(html or "", "html.parser")
+    seen = set()
+    for anchor in soup.find_all("a", href=True):
+        title = clean_text(anchor.get_text(" ", strip=True))
+        link = urljoin(source_url, anchor.get("href", ""))
+        link_l = link.lower()
+        if "/english/news_e/news" not in link_l:
+            continue
+        if not re.search(r"/news\d{2}_e/[^/]+\.htm(?:l)?(?:[?#].*)?$", link_l):
+            continue
+        if link_l.endswith(("/news26_e.htm", "/news26_e.html")):
+            continue
+        key = normalize_url_for_compare(link)
+        if not key or key in seen or is_menu_or_category_link(title, link, source_url):
+            continue
+        seen.add(key)
+        post_date = extract_wto_url_date(link) or find_date_near_anchor(anchor)
+        add_result(post_date, title, link, source_url, agency, site_type)
+        if len(results) - before >= MAX_PER_SITE:
+            break
+    return len(results) - before
+
+
 def crawl_wto(source_url, agency, site_type):
     if "rss" in source_url.lower() or source_url.lower().endswith(".xml"):
         return crawl_rss(source_url, agency, site_type)
 
-    count = crawl_table(source_url, agency, site_type)
+    response = fetch_html(source_url)
+    count = parse_wto_news_page(
+        response.text if response else "", source_url, agency, site_type
+    )
     if count == 0:
-        return crawl_fallback_links(
-            source_url,
-            agency,
-            site_type,
-            allow_keywords=["news", "news_e", "trade", "wto"],
-        )
+        # The static response can contain only the WTO navigation shell.
+        # Render once and apply the same strict detail-link contract.  Never
+        # fall back to generic anchors because that converts six menu labels
+        # into six false "posts" and hides the parser failure.
+        dynamic_html = fetch_selenium_html(source_url, wait_sec=6)
+        count = parse_wto_news_page(dynamic_html, source_url, agency, site_type)
     return count
 
 
@@ -1773,15 +1967,111 @@ def crawl_nsp(source_url, agency, site_type):
     return len(results) - before
 
 
+def parse_cbic_rendered_html(html, source_url):
+    """Return defensible CBIC rows from the Angular-rendered News Updates page."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    rows = []
+    seen = set()
+    containers = soup.select("ul.all-new-list li") or soup.select("#news-marquee li, article, .news-item")
+    for item in containers:
+        anchors = item.find_all("a")
+        title = ""
+        link = source_url
+        for anchor in anchors:
+            candidate = clean_text(anchor.get_text(" ", strip=True) or anchor.get("title", ""))
+            if len(candidate) > len(title) and is_valid_title(candidate):
+                title = candidate
+                href = clean_text(anchor.get("href", ""))
+                if href and not href.lower().startswith(("javascript:", "#")):
+                    link = urljoin(source_url, href)
+        if not title:
+            title = clean_text(item.get_text(" ", strip=True))
+        if not is_valid_title(title):
+            continue
+        item_text = clean_text(item.get_text(" ", strip=True))
+        post_date = extract_date_from_text(item_text) or extract_date_from_text(title)
+        key = (title.lower(), normalize_url_for_compare(link))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((post_date, title, link))
+    return rows
+
+
+def crawl_cbic(source_url, agency, site_type):
+    """CBIC is Angular-rendered; static shell success is not collection success."""
+    before = len(results)
+    rendered = fetch_selenium_html(source_url, wait_sec=7)
+    if not rendered:
+        return 0
+    for post_date, title, link in parse_cbic_rendered_html(rendered, source_url):
+        # Undated candidates stay in audit but cannot prove NO_NEW or enter the
+        # recent regulation feed. This prevents the page update date from being
+        # copied to every post.
+        add_result(post_date, title, link, source_url, agency, site_type)
+        if len(results) - before >= MAX_PER_SITE:
+            break
+    return len(results) - before
+
+
+def federal_register_usitc_api_url(per_page=50):
+    params = {
+        "per_page": max(1, min(int(per_page), 100)),
+        "order": "newest",
+        "conditions[agencies][]": "international-trade-commission",
+    }
+    return "https://www.federalregister.gov/api/v1/documents.json?" + urlencode(params)
+
+
+def parse_federal_register_api(payload):
+    rows = []
+    for item in (payload or {}).get("results", []):
+        title = clean_text(item.get("title", ""))
+        link = clean_text(item.get("html_url", "") or item.get("pdf_url", ""))
+        post_date = item.get("publication_date", "")
+        agencies = item.get("agencies") or []
+        agency_names = " ".join(clean_text(x.get("name", "")) for x in agencies if isinstance(x, dict))
+        if not is_valid_title(title) or not link.startswith("http"):
+            continue
+        if agencies and "international trade commission" not in agency_names.lower():
+            continue
+        rows.append((post_date, title, link))
+    return rows
+
+
+def crawl_usitc_federal_register(agency, site_type):
+    """Official failover for USITC pages blocked by anti-automation controls."""
+    before = len(results)
+    api_url = federal_register_usitc_api_url()
+    try:
+        response = requests.get(
+            api_url,
+            headers={"User-Agent": "GTI-Radar/2.3 official-source-monitor"},
+            timeout=(12, 35),
+        )
+        if response.status_code >= 400:
+            return 0
+        payload = response.json()
+    except (requests.RequestException, ValueError, json.JSONDecodeError):
+        return 0
+    for post_date, title, link in parse_federal_register_api(payload):
+        add_result(post_date, title, link, api_url, agency, site_type)
+        if len(results) - before >= MAX_PER_SITE:
+            break
+    return len(results) - before
+
+
 def crawl_usitc(source_url, agency, site_type):
     count = crawl_card(source_url, agency, site_type)
     if count == 0:
-        return crawl_fallback_links(
+        count = crawl_fallback_links(
             source_url,
             agency,
             site_type,
             allow_keywords=["news", "release", "commission", "notice", "usitc", "investigation"],
         )
+    if count == 0:
+        count = crawl_usitc_federal_register(agency, site_type)
     return count
 
 
@@ -2094,50 +2384,6 @@ def build_admin_rule_url(title, href="", onclick=""):
     return "https://www.law.go.kr/admRulSc.do"
 
 
-LAW_DATE_HEADER_PRIORITY = (
-    "공포일자", "공포일", "발령일자", "발령일", "제정일자", "제정일",
-    "개정일자", "개정일", "의결일자", "의결일", "시행일자", "시행일",
-    "promulgation date", "issued date", "publication date", "effective date",
-)
-LAW_UNTRUSTED_DATE_HEADERS = (
-    "조회일", "검색일", "갱신일", "수정일", "최종수정일", "접속일",
-    "updated", "last modified", "query date", "search date",
-)
-
-
-def _table_headers(row):
-    table = row.find_parent("table")
-    if table is None:
-        return []
-    header_row = table.find("tr")
-    if header_row is None:
-        return []
-    return [clean_text(x.get_text(" ", strip=True)).lower() for x in header_row.find_all(["th", "td"])]
-
-
-def _trusted_law_date(row, cells):
-    """Return only a legally meaningful date; never use query/update dates."""
-    headers = _table_headers(row)
-    for wanted in LAW_DATE_HEADER_PRIORITY:
-        for idx, header in enumerate(headers):
-            if wanted in header and not any(x in header for x in LAW_UNTRUSTED_DATE_HEADERS):
-                if idx < len(cells):
-                    dt = normalize_date(cells[idx]) or extract_date_from_text(cells[idx])
-                    if dt:
-                        return dt, header
-    # Some official tables put the label and value in the same cell.
-    for cell in cells:
-        low = cell.lower()
-        if any(x in low for x in LAW_UNTRUSTED_DATE_HEADERS):
-            continue
-        for wanted in LAW_DATE_HEADER_PRIORITY:
-            if wanted in low:
-                dt = extract_date_from_text(cell)
-                if dt:
-                    return dt, wanted
-    return None, ""
-
-
 def _crawl_structured_rows(source_url, agency, site_type, builder=None, min_cells=4):
     before = len(results)
 
@@ -2155,10 +2401,11 @@ def _crawl_structured_rows(source_url, agency, site_type, builder=None, min_cell
             if title in {"법령명", "행정규칙명", "제목", "규칙명", "사건명"}:
                 continue
 
-            # law.go.kr can expose 조회일/갱신일 beside the legal dates.  A
-            # reverse scan therefore turns decades-old rules into today's
-            # news.  Accept only explicitly labelled legal dates.
-            post_date, date_source = _trusted_law_date(row, cells)
+            post_date = None
+            for cell in reversed(cells):
+                post_date = normalize_date(cell) or extract_date_from_text(cell)
+                if post_date:
+                    break
             if not post_date:
                 continue
 
@@ -2169,10 +2416,7 @@ def _crawl_structured_rows(source_url, agency, site_type, builder=None, min_cell
             display_title = title if not meta else f"{title} ({', '.join(meta[:3])})"
             link = _row_link_with_title(source_url, row, title, builder)
 
-            if add_result(
-                post_date, display_title, link, source_url, agency, site_type,
-                date_source=date_source, date_confidence="LEGAL_DATE",
-            ):
+            if add_result(post_date, display_title, link, source_url, agency, site_type):
                 pass
 
             if len(results) - before >= MAX_PER_SITE:
@@ -2319,18 +2563,14 @@ def crawl_law(source_url, agency, site_type):
             row_text = clean_text(row.get_text(" ", strip=True))
             if len(row_text) < 15:
                 continue
-            cells = [clean_text(cell.get_text(" ", strip=True)) for cell in row.find_all(["td", "th"])]
-            post_date, date_source = _trusted_law_date(row, cells)
+            post_date = extract_date_from_tag(row) or extract_date_from_text(row_text)
             title, link = find_best_anchor(row, source_url)
             if not title:
                 continue
             if not post_date:
                 continue
             link = link or _row_link_with_title(source_url, row, title, build_law_url)
-            add_result(
-                post_date, title, link, source_url, agency, site_type,
-                date_source=date_source, date_confidence="LEGAL_DATE",
-            )
+            add_result(post_date, title, link, source_url, agency, site_type)
             if len(results) - before >= MAX_PER_SITE:
                 break
         if len(results) - before > 0:
@@ -2549,6 +2789,11 @@ def split_final_rows(df):
             row_reasons.append("diagnostic_hint_title")
         if is_menu_or_category_link(title, row.get("url", ""), row.get("source", "")):
             row_reasons.append("menu_or_category_link")
+        if clean_text(row.get("site_type", "")) == "regulation" and not is_policy_content_candidate(title):
+            row_reasons.append("non_policy_content")
+        parsed_dt = normalize_date(row.get("date", ""))
+        if has_url_date_conflict(row.get("url", ""), parsed_dt):
+            row_reasons.append("url_date_conflict")
         if url and source and url == source:
             row_reasons.append("url_equals_source")
         if "#" in str(row.get("url", "")):
@@ -2563,6 +2808,103 @@ def split_final_rows(df):
     final.drop(columns=["_final_exclude_reason"], inplace=True)
 
     return final, excluded
+
+
+def build_policy_candidates(excluded_df):
+    """Preserve official policy signals that lack date/detail proof without promoting them."""
+    columns = [
+        "date", "title", "url", "source", "collected_at", "agency",
+        "site_type", "date_status", "CandidateStatus", "CandidateReason",
+        "PolicySignal", "EligibleForFinalReport",
+    ]
+    if excluded_df is None or excluded_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    policy_terms = re.compile(
+        r"관세|통관|수입|수출|원산지|고시|공고|규정|개정|입법|행정예고|"
+        r"customs|tariff|trade|import|export|origin|notification|notice|"
+        r"regulation|rules?|order|circular|anti[- ]?dumping|countervailing|"
+        r"safeguard|warehous",
+        re.I,
+    )
+    non_policy_terms = re.compile(
+        r"recruit|examination|fellowship|training|vacancy|promotion of|seniority|"
+        r"sports|cultural|tender|procurement|holiday|employee|"
+        r"call for contributions?|call for papers?|newsletter|customs news|"
+        r"issue no\.?|journal|conference|seminar|workshop|webinar|nomination|"
+        r"^federal register notices?$",
+        re.I,
+    )
+    rows = []
+    for _, row in excluded_df.iterrows():
+        if clean_text(row.get("site_type", "")) != "regulation":
+            continue
+        date_status = clean_text(row.get("date_status", ""))
+        title = clean_text(row.get("title", ""))
+        agency = clean_text(row.get("agency", ""))
+
+        # Recent USTR releases may be meaningful official trade-policy signals
+        # even when they do not announce a legally effective measure.  Preserve
+        # them for Global Context review, but never promote them into the final
+        # regulation feed or Samsung Action Queue at STEP1.
+        ustr_context_terms = re.compile(
+            r"tariff|tariff.rate quota|\btrq\b|quota allocation|section 301|"
+            r"public comment|joint (?:ministerial )?statement|excess capacity|"
+            r"coercive trade actions?|forced labor import prohibitions?|"
+            r"trade agreement|usmca|wto|trade barriers?",
+            re.I,
+        )
+        if (
+            agency.startswith("53.USTR")
+            and date_status == "recent"
+            and ustr_context_terms.search(title)
+            and not non_policy_terms.search(title)
+        ):
+            item = {key: row.get(key, "") for key in columns[:8]}
+            item.update({
+                "CandidateStatus": "GLOBAL_CONTEXT_REVIEW",
+                "CandidateReason": "OFFICIAL_POLICY_SIGNAL_REQUIRES_CHANGE_VERIFICATION",
+                "PolicySignal": "Y",
+                "EligibleForFinalReport": "N",
+            })
+            rows.append(item)
+            continue
+
+        if date_status != "no_date":
+            continue
+        item_url = normalize_url_for_compare(row.get("url", ""))
+        source_url = normalize_url_for_compare(row.get("source", ""))
+        same_official_landing = bool(item_url and source_url and item_url == source_url)
+        if is_menu_or_category_link(title, row.get("url", ""), row.get("source", "")) and not same_official_landing:
+            continue
+        if has_stale_explicit_title_year(title):
+            continue
+        if has_stale_official_url_date(row.get("url", "")):
+            continue
+        if not is_policy_content_candidate(title):
+            continue
+        if not policy_terms.search(title) or non_policy_terms.search(title):
+            continue
+        item = {key: row.get(key, "") for key in columns[:8]}
+        item.update({
+            "CandidateStatus": "URGENT_VERIFICATION",
+            "CandidateReason": "OFFICIAL_POST_DATE_OR_DETAIL_URL_PENDING",
+            "PolicySignal": "Y",
+            "EligibleForFinalReport": "N",
+        })
+        rows.append(item)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def is_menu_only_extraction(excluded_rows, final_valid_count=0):
+    """True when a parser returned navigation labels but no real post."""
+    if final_valid_count or excluded_rows is None or excluded_rows.empty:
+        return False
+    if "_final_exclude_reason" not in excluded_rows.columns:
+        return False
+    return excluded_rows["_final_exclude_reason"].fillna("").str.contains(
+        "menu_or_category_link", regex=False
+    ).all()
 
 
 
@@ -2774,7 +3116,10 @@ def main():
             elif parser == "rss_parser":
                 count = crawl_rss(source_url, agency, site_type)
             elif parser == "card_parser":
-                count = crawl_card(source_url, agency, site_type)
+                if "cbic" in agency.lower() or "cbic.gov.in" in source_url.lower():
+                    count = crawl_cbic(source_url, agency, site_type)
+                else:
+                    count = crawl_card(source_url, agency, site_type)
             elif parser == "gwanbo_parser":
                 count = crawl_gwanbo(source_url, agency, site_type)
             elif parser == "gwanbo_selenium_parser":
@@ -2870,17 +3215,19 @@ def main():
         # sites.xlsx status is updated after final filtering.
         time.sleep(SLEEP_SEC)
 
-    df = pd.DataFrame(results)
-    for column in [
-        "date", "title", "url", "source", "collected_at", "agency",
-        "site_type", "date_status", "date_source", "date_confidence",
-    ]:
-        if column not in df.columns:
-            df[column] = ""
-    df = df[[
-        "date", "title", "url", "source", "collected_at", "agency",
-        "site_type", "date_status", "date_source", "date_confidence",
-    ]]
+    df = pd.DataFrame(
+        results,
+        columns=[
+            "date",
+            "title",
+            "url",
+            "source",
+            "collected_at",
+            "agency",
+            "site_type",
+            "date_status",
+        ],
+    )
 
     raw_count = len(df)
 
@@ -2901,6 +3248,21 @@ def main():
         if rejects:
             pd.DataFrame(rejects).to_excel(REJECT_FILE, index=False)
             print(f"🧾 제외 로그: {REJECT_FILE}")
+
+        pd.DataFrame(columns=[
+            "date", "title", "url", "source", "collected_at", "agency",
+            "site_type", "date_status", "CandidateStatus", "CandidateReason",
+            "PolicySignal", "EligibleForFinalReport",
+        ]).to_excel(POLICY_CANDIDATES_FILE, index=False)
+        if crawl_health:
+            for health in crawl_health:
+                health["final_valid_count"] = 0
+                health["final_excluded_count"] = 0
+                health["final_exclude_reasons"] = ""
+                health["final_status"] = "FAIL" if health.get("status") == "FAIL" else "NO_NEW"
+            pd.DataFrame(crawl_health).to_excel(CRAWL_HEALTH_FILE, index=False)
+        print(f"📁 공식 정책 후보: {POLICY_CANDIDATES_FILE} / 0건")
+        print(f"🩺 사이트 탐지 진단: {CRAWL_HEALTH_FILE}")
 
         return
 
@@ -2924,6 +3286,7 @@ def main():
 
     audit_df = df.copy()
     final_df, excluded_df = split_final_rows(df)
+    candidate_df = build_policy_candidates(excluded_df)
     final_count = len(final_df)
     final_filter_removed = len(excluded_df)
 
@@ -2939,11 +3302,20 @@ def main():
                 )
         for health in crawl_health:
             agency_name = health.get("site", "")
+            agency_audit = audit_df[audit_df["agency"].astype(str).map(clean_text).eq(clean_text(agency_name))]
+            if not agency_audit.empty:
+                actual_dates = pd.to_datetime(agency_audit["date"], errors="coerce").dropna()
+                if not actual_dates.empty:
+                    health["latest_date_hint"] = actual_dates.max().strftime("%Y-%m-%d %H:%M:%S")
             valid_n = int(final_by_agency.get(agency_name, 0))
             excluded_n = int(excluded_by_agency.get(agency_name, 0))
             health["final_valid_count"] = valid_n
             health["final_excluded_count"] = excluded_n
             health["final_exclude_reasons"] = excluded_reason_by_agency.get(agency_name, "")
+            agency_excluded = excluded_df[
+                excluded_df["agency"].astype(str).map(clean_text).eq(clean_text(agency_name))
+            ] if not excluded_df.empty else pd.DataFrame()
+            menu_only_extraction = is_menu_only_extraction(agency_excluded, valid_n)
             if health.get("status") == "FAIL":
                 health["final_status"] = "FAIL"
             elif health.get("status") == "CHECK_REQUIRED":
@@ -2952,6 +3324,10 @@ def main():
                 health["final_status"] = "PARTIAL_COVERAGE"
             elif valid_n > 0:
                 health["final_status"] = "VALID_REGULATION"
+            elif menu_only_extraction:
+                health["status"] = "PARSE_ZERO"
+                health["final_status"] = "PARSE_ZERO"
+                health["zero_yield_reason"] = "PARSER_RETURNED_MENU_LINKS_ONLY"
             elif int(health.get("real_posts_found", 0) or 0) > 0:
                 health["final_status"] = "ALL_FILTERED"
             else:
@@ -2962,6 +3338,7 @@ def main():
         save_split_files(final_df)
         if not excluded_df.empty:
             excluded_df.to_excel(FINAL_EXCLUDED_FILE, index=False)
+        candidate_df.to_excel(POLICY_CANDIDATES_FILE, index=False)
     except PermissionError:
         alt = BASE_DIR / "1.site_news_raw_new.xlsx"
         final_df.to_excel(alt, index=False)
@@ -2998,6 +3375,7 @@ def main():
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")
     print(f"📁 최종 제외 파일: {FINAL_EXCLUDED_FILE}")
+    print(f"📁 공식 정책 후보: {POLICY_CANDIDATES_FILE} / {len(candidate_df)}건")
     print("📌 sites.xlsx 업데이트 기준 = 최종 유효 법규: collected_count / total_collected / last_checked / 최근게시일")
     print(f"🧾 제외 로그: {REJECT_FILE}")
     print(f"🩺 사이트 탐지 진단: {CRAWL_HEALTH_FILE}")
