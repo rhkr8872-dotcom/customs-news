@@ -1,60 +1,231 @@
-name: daily-customs-brief
-
 on:
   schedule:
     # 07:00 KST = 22:00 UTC (previous day)
-    - cron: "0 23 * * *"
+    - cron: "0 20 * * *"
   workflow_dispatch:
+    inputs:
+      send_email:
+        description: "Send the GTI email"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: gti-daily-mail
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
 
 jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  gti-mail:
+    runs-on: windows-latest
+    timeout-minutes: 180
 
-      - uses: actions/setup-python@v5
+    permissions:
+      contents: read
+
+    env:
+      GTI_BASE_DIR: C:\temp
+      GTI_OUTPUT_DIR: C:\temp
+      GTI_LOOKBACK_HOURS: "24"
+      GTI_MAX_PER_SOURCE: "50"
+
+      GTI_SEND_EMAIL_SECRET: ${{ secrets.GTI_SEND_EMAIL }}
+      GTI_SMTP_HOST: ${{ secrets.GTI_SMTP_HOST }}
+      GTI_SMTP_PORT: ${{ secrets.GTI_SMTP_PORT }}
+      GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
+      GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
+      GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
+
+      NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+      NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+      SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+      NEWS_API: ${{ secrets.NEWS_API }}
+      NEWS_KEY: ${{ secrets.NEWS_KEY }}
+
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: pip
+
+      - name: Create folders
+        shell: pwsh
+        run: |
+          @(
+            "C:\temp",
+            "C:\temp\logs",
+            "C:\temp\archive",
+            "C:\temp\12345",
+            "outputs",
+            "outputs\logs",
+            "outputs\archive"
+          ) | ForEach-Object {
+            New-Item -ItemType Directory -Force -Path $_ | Out-Null
+          }
+
+      # Restore only cumulative history, never yesterday's daily stage outputs.
+      - name: Restore GTI cumulative archive
+        id: restore-gti-archive
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            C:\temp\archive
+            C:\temp\12345
+          key: gti-archive-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gti-archive-${{ runner.os }}-
+
+      - name: Copy GTI program and configuration files
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter "*.py" |
+            Copy-Item -Destination "C:\temp" -Force
+
+          # Exclude old pipeline outputs that could trigger a stale-file error.
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter "*.xlsx" |
+            Where-Object {
+              $_.Name -notmatch '^[1-5]-' -and
+              $_.Name -notmatch '^GTI_Radar_' -and
+              $_.Name -notmatch '^\[GTI Radar\]'
+            } |
+            Copy-Item -Destination "C:\temp" -Force
+
+          @("*.csv", "*.json", "*.txt") | ForEach-Object {
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter $_ |
+              Copy-Item -Destination "C:\temp" -Force
+          }
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r "$env:GITHUB_WORKSPACE\requirements.txt"
 
-      - name: Prepare out dir
+      - name: Validate required settings
+        shell: pwsh
         run: |
-          mkdir -p out
+          $requiredFiles = @(
+            "C:\temp\1.site_crawler.py",
+            "C:\temp\3-1.regulation_merge.py",
+            "C:\temp\3-2.news_merge.py",
+            "C:\temp\4-1.regulation_ai_analysis.py",
+            "C:\temp\4-2.news_ai_analysis.py",
+            "C:\temp\5.GTI_Mail_Engine.py",
+            "C:\temp\7.run_gti_pipeline.py",
+            "C:\temp\gti_report_window.py",
+            "C:\temp\gti_quality_contract.py"
+          )
+          $missingFiles = $requiredFiles | Where-Object { -not (Test-Path $_) }
+          if ($missingFiles) {
+            throw "Missing required file(s): $($missingFiles -join ', ')"
+          }
 
-      - name: Run script
-        env:
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          RECIPIENTS: ${{ secrets.RECIPIENTS }}
-          RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_ENABLED: "1"
-          GEMINI_MODEL: "gemini-1.5-flash"
-          BASE_DIR: ${{ github.workspace }}/out
-          CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
-          SITES_FILE: ${{ github.workspace }}/sites.xlsx
-          WINDOW_START_HOUR_KST: "7"
-          NEWS_LOOKBACK_HOURS: "24"
-          MAX_ITEMS_PER_QUERY: "10"
+          python -c "import sys; sys.path.insert(0, r'C:\temp'); import gti_report_window, gti_quality_contract; print('GTI shared modules OK:', gti_quality_contract.VERSION)"
+
+          $requiredSecrets = @(
+            "NAVER_CLIENT_ID",
+            "NAVER_CLIENT_SECRET",
+            "GEMINI_API_KEY"
+          )
+          $missingSecrets = $requiredSecrets | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          }
+          if ($missingSecrets) {
+            throw "Missing required GitHub secret(s): $($missingSecrets -join ', ')"
+          }
+
+      - name: Set mail mode
+        shell: pwsh
         run: |
-          python daily_brief.py
+          $secretEnabled = "$env:GTI_SEND_EMAIL_SECRET" -match '^(?i:true|1|yes|y|on)$'
+          $manualApproved = "${{ github.event.inputs.send_email }}" -eq "true"
+          $scheduledRun = "${{ github.event_name }}" -eq "schedule"
+          $sendMail = $secretEnabled -and ($scheduledRun -or $manualApproved)
 
-      - name: Upload outputs
-        uses: actions/upload-artifact@v4
+          "GTI_SEND_EMAIL=$($sendMail.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "GTI email enabled: $sendMail"
+
+      - name: Show execution inputs
+        shell: pwsh
+        run: |
+          Write-Host "===== Repository files ====="
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File | Select-Object Name, Length
+          Write-Host "===== C:\temp input files ====="
+          Get-ChildItem -Path "C:\temp" -File | Select-Object Name, Length, LastWriteTime
+          Write-Host "===== Restored archive ====="
+          Get-ChildItem -Path "C:\temp\archive" -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime
+
+      - name: Run GTI pipeline
+        id: run-gti-pipeline
+        shell: pwsh
+        run: |
+          $logPath = Join-Path $env:GITHUB_WORKSPACE "outputs\pipeline_console.log"
+          & python "C:\temp\7.run_gti_pipeline.py" 2>&1 |
+            Tee-Object -FilePath $logPath
+          $pipelineExitCode = $LASTEXITCODE
+
+          if ($pipelineExitCode -ne 0) {
+            Write-Error "GTI pipeline failed with exit code $pipelineExitCode"
+            exit $pipelineExitCode
+          }
+
+      - name: Copy results to outputs
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\temp\logs") {
+            Copy-Item "C:\temp\logs\*" "outputs\logs" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "C:\temp\archive") {
+            Copy-Item "C:\temp\archive\*" "outputs\archive" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          # Search recursively because STEP5 can write under
+          # C:\temp\12345\c_type_outputs instead of C:\temp root.
+          $freshCutoff = (Get-Date).AddHours(-4)
+          Get-ChildItem "C:\temp" -Recurse -File | Where-Object {
+            $_.LastWriteTime -ge $freshCutoff -and
+            $_.FullName -notlike "C:\temp\archive\*" -and
+            $_.Extension -in @(".xlsx", ".html") -and (
+              $_.Name -match '^[1-5]-' -or
+              $_.Name -match '^GTI_Radar_' -or
+              $_.Name -match '^\[GTI Radar\]'
+            )
+          } | ForEach-Object {
+            Copy-Item $_.FullName -Destination (Join-Path "outputs" $_.Name) -Force
+          }
+
+          Get-ChildItem "C:\temp" -File -Filter "*.log" |
+            Copy-Item -Destination "outputs\logs" -Force
+
+      - name: Save GTI cumulative data
+        # Keep the last valid history. A failed/partial run must not replace it.
+        if: success()
+        uses: actions/cache/save@v5
         with:
-          name: outputs-${{ github.run_id }}
-          path: out
+          path: |
+            C:\temp\archive
+            C:\temp\12345
+          key: gti-archive-${{ runner.os }}-${{ github.run_id }}
 
-      - name: Commit & push outputs to repo
-        run: |
-          git config user.name "actions-user"
-          git config user.email "actions@users.noreply.github.com"
-          git add out || true
-          git commit -m "Daily outputs: $(date -u +%Y-%m-%d)" || echo "No changes"
-          git push
+      - name: Upload GTI artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gti-radar-output-${{ github.run_number }}
+          path: outputs
+          if-no-files-found: warn
+          retention-days: 30
