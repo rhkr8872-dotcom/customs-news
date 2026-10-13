@@ -307,7 +307,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v52.0 EVIDENCE-FIRST EXECUTIVE BRIEF"
+ENGINE_VERSION = "v52.1 EVIDENCE-FIRST EXECUTIVE BRIEF FINAL GATES"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -344,6 +344,30 @@ def _row_native_text(row: pd.Series) -> str:
 def _canonical_policy_family(row: pd.Series) -> str:
     """Stable event identity across publishers and Korean/English headlines."""
     t = _row_native_text(row)
+    if re.search(r"cbam|탄소국경조정", t, re.I) and re.search(
+        r"미국|ustr|u\.s\.|united states", t, re.I
+    ) and re.search(r"무역장벽|대응\s*조치|의견\s*수렴|trade barrier|response|comments", t, re.I):
+        return "US_EU_CBAM_TRADE_BARRIER_REVIEW_2026"
+    if re.search(r"대외무역법|foreign trade act", t, re.I) and re.search(
+        r"국가안보|정보보호|national security|information protection", t, re.I
+    ) and re.search(r"수출입\s*제한|import.*export.*restrict|trade restriction", t, re.I):
+        return "KR_FOREIGN_TRADE_ACT_SECURITY_RESTRICTION_2026"
+    if re.search(r"관세청|korea customs service", t, re.I) and re.search(
+        r"인도|india", t, re.I
+    ) and re.search(r"이집트|egypt", t, re.I) and re.search(r"연수|교육|training", t, re.I):
+        return "KR_KCS_INDIA_EGYPT_TRAINING_2026"
+    if re.search(r"fedex|페덱스", t, re.I) and re.search(
+        r"import tool|수입\s*통관|관부가세.*결제", t, re.I
+    ):
+        return "FEDEX_IMPORT_TOOL_KR_2026"
+    if re.search(r"전략물자|strategic item|export control", t, re.I) and re.search(
+        r"불법\s*수출|우회\s*수출|illegal export|circumvention", t, re.I
+    ) and re.search(r"ai\s*서버|server|반도체|semiconductor|134배", t, re.I):
+        return "KR_ELECTRONICS_STRATEGIC_EXPORT_ENFORCEMENT_2026"
+    if re.search(r"외국환거래규정|foreign exchange transaction regulation", t, re.I) and re.search(
+        r"개정|행정예고|amend|notice", t, re.I
+    ):
+        return "KR_FOREIGN_EXCHANGE_REGULATION_AMENDMENT_2026"
     if re.search(r"코트라|kotra", t, re.I) and re.search(r"관세\s*환급|tariff\s*refund", t, re.I) and re.search(r"5244|5천\s*200|5200|50여\s*개사|48개사|50개사", t, re.I):
         return "KR_KOTRA_US_TARIFF_REFUND_2026"
     if "cptpp" in t and re.search(r"가입|보류|제동|무산|지연|bid|membership", t, re.I):
@@ -449,6 +473,13 @@ def _context_noise(row: pd.Series) -> bool:
         r"현장조사\s*거부|incoming passengers|duty-not-paid cigarettes|여행객|담배",
         title, re.I,
     ))
+    customs_training = bool(re.search(
+        r"(?:관세청|세관|customs).{0,50}(?:연수|교육|전수|training)|"
+        r"(?:연수|교육|전수|training).{0,50}(?:관세청|세관|customs)", t, re.I,
+    )) and not samsung_named
+    private_service = bool(re.search(r"fedex|페덱스", t, re.I)) and bool(re.search(
+        r"플랫폼|서비스|import tool|통합\s*결제|온라인\s*결제", t, re.I,
+    )) and not samsung_named
     negotiation_only = bool(re.search(
         r"협상|negotiation|talks", title, re.I,
     )) and not bool(re.search(
@@ -457,7 +488,10 @@ def _context_noise(row: pd.Series) -> bool:
     implementation_check_only = bool(re.search(
         r"이행\s*(?:상황\s*)?점검|상황\s*점검|implementation\s+review", title, re.I,
     )) and not bool(re.search(r"고시|개정|시행|제정|부과|금지|official notice|amended|effective", title, re.I))
-    absolute_noise = executive_or_generic_ai or agriculture_enforcement or unrelated_enforcement
+    absolute_noise = (
+        executive_or_generic_ai or agriculture_enforcement or unrelated_enforcement
+        or customs_training or private_service
+    )
     conditional_noise = (
         hard_noise or old_policy_rehash or opinion_or_history or employment_support
         or non_policy_story or negotiation_only or implementation_check_only
@@ -468,6 +502,22 @@ def _context_noise(row: pd.Series) -> bool:
 def _samsung_watch_scope(row: pd.Series) -> bool:
     """Require a plausible Samsung customs route, not a product buzzword alone."""
     t = _row_native_text(row)
+    headline = s(row.get("Headline")).lower()
+    mapped_entity_text = s(row.get("MappedEntity"))
+    explicit_samsung_map = bool(re.search(r"samsung|삼성", mapped_entity_text, re.I))
+    # Hard negatives use the headline, which is not polluted by navigation or
+    # related-news tails in a scraped article body.
+    if re.search(r"(?:관세청|세관).{0,40}(?:연수|교육|전수)|(?:연수|교육|전수).{0,40}(?:관세청|세관)", headline, re.I):
+        return False
+    if re.search(r"fedex|페덱스", headline, re.I) and re.search(
+        r"플랫폼|서비스|import tool|결제|통관\s*서류", headline, re.I
+    ) and not explicit_samsung_map:
+        return False
+    if re.search(r"cbam|탄소국경조정", headline, re.I) and not re.search(
+        r"삼성|반도체|디스플레이|배터리|전자제품|semiconductor|display|battery|electronics",
+        headline, re.I,
+    ) and not explicit_samsung_map:
+        return False
     samsung_named = bool(re.search(
         r"삼성전자|삼성sdi|samsung electronics|samsung semiconductor|samsung sdi",
         t, re.I
@@ -480,13 +530,14 @@ def _samsung_watch_scope(row: pd.Series) -> bool:
     electronics = bool(re.search(
         r"반도체|semiconductor|메모리|chip|스마트폰|smartphone|휴대폰|display|oled|"
         r"가전|전자제품|electronics|lg전자|엘지전자|sk하이닉스|sk hynix|tsmc|asml|"
-        r"네트워크장비|배터리|battery",
+        r"네트워크장비|배터리|battery|ai\s*서버|server|데이터센터\s*장비",
         t, re.I,
     ))
     specific_product = bool(re.search(
         r"\blfp\b|\bncm\d*\b|\bess\b\s*(?:용)?\s*배터리|에너지저장장치|\bbess\b|oled|hbm|dram|nand|"
         r"냉장고|세탁기|에어컨|tv|스마트폰|통신장비|네트워크장비|"
-        r"반도체\s*(?:장비|소자|칩|메모리)|hs\s*(?:84|85)\d{2,}", t, re.I
+        r"반도체\s*(?:장비|소자|칩|메모리)|ai\s*서버|server|데이터센터\s*장비|"
+        r"hs\s*(?:84|85)\d{2,}", t, re.I
     ))
     route = bool(re.search(
         r"미국\s*투자|현지\s*생산|한국.{0,20}미국|베트남|vietnam|재수출|환적|"
@@ -500,7 +551,7 @@ def _samsung_watch_scope(row: pd.Series) -> bool:
     )) and bool(re.search(
         r"조사\s*개시|추징|과세\s*처분|심판|판결|재결|분류\s*결정|assessment|duty demand|appeal|ruling|judgment", t, re.I
     ))
-    mapped_entity = s(row.get("MappedEntity"))
+    mapped_entity = mapped_entity_text
     samsung_mapped = bool(re.search(
         r"samsung|삼성|sea\b|ssi\b|semiconductor inc", mapped_entity, re.I
     ))
@@ -510,7 +561,6 @@ def _samsung_watch_scope(row: pd.Series) -> bool:
         and bool(s(row.get("MappedHS")) or s(row.get("TradeRoute")))
     )
     ai_relevant = s(row.get("AIRelevant")).upper() == "Y"
-    headline = s(row.get("Headline")).lower()
     headline_customs_product = bool(re.search(
         r"관세|통관|품목분류|수출통제|tariff|customs|export control", headline, re.I
     )) and bool(re.search(
@@ -527,6 +577,32 @@ def _samsung_watch_scope(row: pd.Series) -> bool:
         route and (explicit_electronics_link or specific_product) and ai_relevant
     )
     return customs and ((peer_case and ai_relevant) or mapped or article_product_gate)
+
+
+def _pending_official_regulation_watch(row: pd.Series) -> bool:
+    """Keep material official regulation candidates visible while the body is pending."""
+    if s(row.get("Content Type")).lower() != "regulation":
+        return False
+    t = " ".join([
+        s(row.get("Headline")), s(row.get("Agency")), s(row.get("Source")),
+        s(row.get("URL")), s(row.get("OfficialURL")),
+    ]).lower()
+    official = bool(re.search(
+        r"gwanbo\.go\.kr|customs\.go\.kr|unipass|motie\.go\.kr|moef\.go\.kr|"
+        r"law\.go\.kr|관보|관세청|산업통상|재정경제부|기획재정부", t, re.I,
+    ))
+    material = bool(re.search(
+        r"관세|통관|품목분류|수입신고|납세신고|전자문서|외국환거래|수출입대금|"
+        r"보세|환급|fta|원산지|수출통제|전략물자|5fe|5fk", t, re.I,
+    ))
+    administrative_noise = bool(re.search(
+        r"항만개발사업|도로|하천|출입국관리|식품산업|농림|축산|항공보안", t, re.I,
+    ))
+    return official and material and not administrative_noise
+
+
+def _mojibake_score(value: str) -> int:
+    return len(re.findall(r"[ąĄµˇÁŔżŮş±ĚŽź¤ŰĹÄ]", s(value)))
 
 
 def _direct_samsung_customs_case(row: pd.Series) -> bool:
@@ -716,9 +792,12 @@ def _collapse_policy_events(d: pd.DataFrame) -> pd.DataFrame:
         .fillna("").astype(str).str.upper().eq("VERIFIED_EXACT").astype(int)
     )
     out["_body_rank2"] = yn(out, "Body Verified").astype(int)
+    out["_headline_rank2"] = out.get("Headline", pd.Series("", index=out.index)).map(
+        lambda value: int(_mojibake_score(value) == 0)
+    )
     out = out.sort_values(
-        ["_quality_family", "_official_rank2", "_body_rank2", "_score"],
-        ascending=[True, False, False, False], kind="stable",
+        ["_quality_family", "_headline_rank2", "_official_rank2", "_body_rank2", "_score"],
+        ascending=[True, False, False, False, False], kind="stable",
     )
     kept = []
     for _, group in out.groupby("_quality_family", sort=False, dropna=False):
@@ -735,7 +814,9 @@ def _collapse_policy_events(d: pd.DataFrame) -> pd.DataFrame:
         rep["AlternateHeadlines"] = " | ".join(dict.fromkeys(headlines))
         rep["AlternateURLs"] = " | ".join(dict.fromkeys(urls))
         kept.append(rep)
-    return pd.DataFrame(kept).drop(columns=["_official_rank2", "_body_rank2"], errors="ignore")
+    return pd.DataFrame(kept).drop(
+        columns=["_official_rank2", "_body_rank2", "_headline_rank2"], errors="ignore"
+    )
 
 
 def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -852,9 +933,13 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     )
     direct_case = d.apply(_direct_samsung_customs_case, axis=1)
     customs_case = yn(d, "CustomsCaseFlag")
+    pending_regulation = d.apply(_pending_official_regulation_watch, axis=1)
     # CustomsCaseFlag is only a case-type hint. It cannot promote a row by
     # itself. Strict article-native Samsung scope is mandatory.
-    protected_watch = direct_case | trade | samsung_scope | rescued_customs
+    # Never promote a row merely because STEP4/AI set SamsungTradeGateFlag.
+    # Promotion requires article-native Samsung/electronics evidence, a direct
+    # Samsung customs case, or a material official regulation pending review.
+    protected_watch = direct_case | samsung_scope | rescued_customs | pending_regulation
     context_noise = d.apply(_context_noise, axis=1)
     excluded_mask = administrative_only | (
         (declared_excluded | context_noise) & ~protected_watch
