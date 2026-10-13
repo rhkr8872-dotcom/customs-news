@@ -1,5 +1,5 @@
-﻿# -*- coding: utf-8 -*-
-# GTI FINAL CORE v9 - News merge, title-keyword priority + URL quality guard
+# -*- coding: utf-8 -*-
+# GTI v5.4 STEP3-2 - Balanced Customs/Trade Candidate Engine / Same-day rerun safe
 """
 STEP3-2 : news_merge.py
 
@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import zipfile
 import shutil
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
@@ -37,6 +38,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
 
 import pandas as pd
+from gti_report_window import previous_kst_day_mask
+import requests
+from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -45,8 +49,8 @@ from openpyxl.utils import get_column_letter
 BASE_DIR = Path(os.getenv("STEP3_BASE_DIR", r"C:\Temp"))
 
 INPUT_FILES = [
-    # STEP1에서 LAW1(공인 법규)로 확정되지 않은 공식기관 공지/보도/정책자료도 뉴스 후보로 병합
-    BASE_DIR / "1-2.site_news_raw.xlsx",
+    # STEP2-3가 사이트 뉴스 + RSS 뉴스를 모두 담당합니다.
+    # STEP1(1.site_crawler)은 법규 전용이며 뉴스 파일을 생성/참조하지 않습니다.
     BASE_DIR / "2-1.naver_news_raw.xlsx",
     BASE_DIR / "2-2.google_news_raw.xlsx",
     BASE_DIR / "2-3.rss_news_raw.xlsx",
@@ -61,11 +65,15 @@ KEYWORD_FILES = [
     BASE_DIR / "keyword_master_trade_policy_150.xlsx",
 ]
 
-RECENT_HOURS = int(os.getenv("GTI_STEP3_RECENT_HOURS", "72"))
-MAX_OUTPUT = 300
+RECENT_HOURS = int(os.getenv("GTI_STEP3_RECENT_HOURS", "24"))
+URL_RESOLVE_LIMIT = int(os.getenv("GTI_STEP3_URL_RESOLVE_LIMIT", "120"))
+ALLOW_COLLECTED_DATE_FALLBACK = os.getenv("GTI_STEP3_ALLOW_COLLECTED_FALLBACK", "N").strip().upper() == "Y"
+MAX_OUTPUT = int(os.getenv("GTI_STEP3_TARGET_MAX", "300"))
 MIN_SCORE = 20
-MAX_PER_ISSUE_CLUSTER = 1
-MAX_TRADE_GENERAL_OUTPUT = 60
+MAX_PER_ISSUE_CLUSTER = int(os.getenv("GTI_STEP3_CLUSTER_KEEP", "2"))
+MAX_TRADE_GENERAL_OUTPUT = int(os.getenv("GTI_STEP3_TRADE_GENERAL_MAX", "80"))
+ALLOW_MISSING_NEWS_INPUT = os.getenv("GTI_ALLOW_MISSING_NEWS_INPUT", "N").strip().upper() in {"Y", "YES", "TRUE", "1"}
+INPUT_MAX_AGE_HOURS = float(os.getenv("GTI_NEWS_INPUT_MAX_AGE_HOURS", "18"))
 
 # STEP3 최종 Summary Tier 배분 목표
 # - STEP3는 임원보고 최종본이 아니라 STEP4 AI 분석 후보군입니다.
@@ -143,6 +151,8 @@ FINAL_COLS = [
     "KeywordMatches",
     "TitleKeywordFlag",
     "TitleKeywordMatches",
+    "CustomsGateFlag",
+    "CustomsGateReason",
     "OriginalURLVerified",
     "URLQuality",
     "IssueClusterKey",
@@ -237,10 +247,219 @@ TITLE_KEYWORD_TERMS = sorted(set(FALLBACK_TRADE_KEYWORDS + [
     "trade remedy", "export controls", "entity list", "uflpa", "forced labor",
     "free trade agreement", "rules of origin", "origin rule", "preference",
     "classification", "hs classification", "quota", "safeguard",
+    "de minimis", "small parcel", "low value consignment", "parcel duty",
+    "customs valuation", "manifestacion de valor", "manifestación de valor",
+    "mve", "bonded warehouse", "transshipment", "circumvention",
     "관세법", "관세청", "상호관세", "추가관세", "덤핑방지관세", "무역구제",
     "자유무역협정", "협정세율", "특혜관세", "원산지증명", "원산지 기준",
     "수출관리", "전략물자", "강제노동", "품목번호", "품목분류", "탄소국경",
+    "소액", "소포장", "직구", "면세", "가치신고", "가치선언",
+    "보세창고", "우회수출", "불법수출",
 ]), key=lambda x: x.lower())
+
+
+# ------------------------------------------------------------------
+# GTI v5.2 STRICT CUSTOMS / TRADE GATE
+# Step2 is intentionally broad. Step3 must require an explicit customs/trade
+# policy signal before Samsung/product scoring is allowed to matter.
+# Generic "trade", "export", "semiconductor", "China", "Samsung" alone is NOT enough.
+# ------------------------------------------------------------------
+STRICT_CUSTOMS_GATE_RULES = [
+    ("TARIFF", [
+        "tariff", "tariffs", "customs duty", "import duty", "export duty",
+        "additional tariff", "additional duty", "reciprocal tariff",
+        "section 232", "section 301", "301 tariff", "232 tariff",
+        "관세", "관세율", "상호관세", "추가관세", "수입관세", "수출관세",
+    ]),
+    ("AD_CVD", [
+        "anti-dumping", "anti dumping", "antidumping", "countervailing",
+        "countervailing duty", "ad/cvd", "cvd", "dumping duty",
+        "반덤핑", "덤핑방지관세", "상계관세", "무역구제",
+    ]),
+    ("ORIGIN_FTA", [
+        "rules of origin", "rule of origin", "certificate of origin",
+        "preferential tariff", "preferential duty", "free trade agreement",
+        "fta", "cepa", "rcep", "usmca",
+        "원산지", "원산지증명", "협정세율", "특혜관세", "자유무역협정",
+    ]),
+    ("EXPORT_CONTROL", [
+        "export control", "export controls", "entity list", "denied persons",
+        "bureau of industry and security", "bis rule", "ear99", "export administration regulations",
+        "uflpa", "forced labor import ban", "sanctions", "sanctioned entity",
+        "수출통제", "수출관리", "전략물자", "엔티티 리스트", "제재대상", "강제노동",
+    ]),
+    ("CUSTOMS", [
+        "customs", "customs clearance", "customs valuation", "customs declaration",
+        "import declaration", "export declaration", "de minimis", "low value consignment",
+        "bonded warehouse", "customs broker", "customs procedure",
+        "통관", "세관", "수입신고", "수출신고", "관세평가", "과세가격",
+        "특송물품", "보세", "관세환급", "소액면세",
+    ]),
+    ("HS_CLASSIFICATION", [
+        "hs code", "hs classification", "tariff classification",
+        "harmonized system", "품목분류", "hs코드", "품목번호",
+    ]),
+    ("CBAM_CARBON", [
+        "cbam", "carbon border adjustment", "carbon border tax",
+        "탄소국경조정", "탄소국경세",
+    ]),
+    ("SAFEGUARD", [
+        "safeguard duty", "safeguard measure", "safeguard tariff",
+        "세이프가드", "긴급수입제한",
+    ]),
+]
+
+# Competition-law / generic corporate-news false-positive blocker.
+# These articles are rejected unless an independent strict customs signal exists.
+NON_CUSTOMS_POLICY_CONTEXT = [
+    "공정위", "공정거래위원회", "담합", "카르텔", "시장지배적",
+    "competition commission", "competition authority", "antitrust", "cartel",
+    "price fixing", "merger review", "consumer protection",
+    "실적 발표", "영업이익", "주가", "목표주가", "시가총액",
+    "earnings", "stock price", "price target",
+]
+
+EVENT_PRODUCT_TERMS = [
+    "polysilicon", "폴리실리콘", "semiconductor", "semiconductors", "반도체",
+    "steel", "철강", "aluminum", "aluminium", "알루미늄", "copper", "구리",
+    "solar", "태양광", "battery", "batteries", "배터리",
+    "automobile", "automotive", "auto", "자동차",
+    "smartphone", "mobile phone", "스마트폰", "display", "oled", "디스플레이",
+    "chemical", "chemicals", "화학", "pharmaceutical", "의약품",
+    "rare earth", "희토류", "critical mineral", "핵심광물",
+]
+
+EVENT_POLICY_TERMS = [
+    "section 232", "232조", "section 301", "301조", "ieepa",
+    "reciprocal tariff", "상호관세", "anti-dumping", "antidumping", "반덤핑",
+    "countervailing", "상계관세", "safeguard", "세이프가드",
+    "export control", "수출통제", "entity list", "uflpa",
+    "cbam", "탄소국경", "de minimis", "소액면세",
+]
+
+
+def strict_customs_gate(row: pd.Series) -> tuple[bool, str]:
+    """Require an explicit customs/trade-policy signal independent of Samsung/product terms."""
+    title = clean(row.get("Headline", "")).lower()
+    full = analysis_text(row).lower()
+
+    title_hits = []
+    body_hits = []
+    for label, terms in STRICT_CUSTOMS_GATE_RULES:
+        if contains_any(title, terms):
+            title_hits.append(label)
+        elif contains_any(full, terms):
+            body_hits.append(label)
+
+    # Strong title evidence is preferred. Body/summary evidence is also accepted.
+    hits = list(dict.fromkeys(title_hits + body_hits))
+    if not hits:
+        return False, "NO_EXPLICIT_CUSTOMS_TRADE_SIGNAL"
+
+    # Explicit customs evidence overrides competition/corporate context.
+    # Otherwise generic business/policy articles cannot enter by Samsung relevance alone.
+    return True, ";".join(hits)
+
+
+def event_anchor_tokens(row: pd.Series) -> list[str]:
+    """Build stable event anchors for cross-publisher clustering."""
+    text = analysis_text(row).lower()
+    anchors = []
+
+    for term in EVENT_POLICY_TERMS:
+        if term in text and term not in anchors:
+            anchors.append(term)
+
+    for term in EVENT_PRODUCT_TERMS:
+        if term in text and term not in anchors:
+            anchors.append(term)
+
+    # Capture tariff/duty percentages: e.g. 15%, 25%, 50%.
+    for pct in re.findall(r'(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%', text):
+        token = f"{pct}%"
+        if token not in anchors:
+            anchors.append(token)
+
+    return anchors[:8]
+
+
+
+# ------------------------------------------------------------------
+# GTI v5.3 BALANCED GATE
+# Strict customs signals are CORE. Contextual trade-policy signals are allowed
+# as USABLE/REFERENCE so Step4 Gemini has enough candidates to judge.
+# ------------------------------------------------------------------
+CONTEXTUAL_TRADE_TERMS = [
+    # general trade-policy context
+    "trade policy", "trade barrier", "market access", "trade agreement",
+    "trade negotiation", "trade dispute", "trade restriction",
+    "import restriction", "export restriction", "import ban", "export ban",
+    "import quota", "export quota", "quota", "non-tariff barrier",
+    "supply chain restriction", "economic security",
+    "무역정책", "통상정책", "무역장벽", "시장접근", "통상협상", "무역분쟁",
+    "수입규제", "수출규제", "수입금지", "수출금지", "수입쿼터", "비관세장벽",
+    "경제안보", "공급망 규제",
+
+    # institutions / measures strongly associated with customs-trade work
+    "ustr", "us trade representative", "wto", "world trade organization",
+    "usitc", "international trade commission", "commerce department",
+    "department of commerce", "bureau of industry and security",
+    "european commission trade", "dg trade",
+    "미 무역대표부", "미국 무역대표부", "미 상무부", "미국 상무부",
+    "산업안보국", "무역위원회",
+
+    # policy verbs
+    "investigation into imports", "investigation of imports",
+    "trade investigation", "circumvention", "anti-circumvention",
+    "import licensing", "export licensing",
+    "수입 조사", "무역 조사", "우회수출", "우회덤핑", "수입허가", "수출허가",
+]
+
+GENERIC_ECONOMY_NOISE = [
+    "주가", "목표주가", "시가총액", "실적 발표", "영업이익", "매출", "증시",
+    "earnings", "stock price", "price target", "market cap",
+    "관광", "여행", "스포츠", "연예", "부동산", "날씨", "사건사고",
+    "tourism", "travel", "sports", "entertainment", "real estate", "weather",
+]
+
+CUSTOMS_CORE_ISSUES = {
+    "TARIFF", "AD_CVD", "ORIGIN_FTA", "EXPORT_CONTROL",
+    "CUSTOMS", "HS_CLASSIFICATION", "CBAM_CARBON", "SAFEGUARD"
+}
+
+
+def contextual_trade_gate(row: pd.Series) -> tuple[bool, str]:
+    """Secondary trade-policy gate for Step4 candidate preservation."""
+    title = clean(row.get("Headline", "")).lower()
+    full = analysis_text(row).lower()
+
+    if contains_any(full, GENERIC_ECONOMY_NOISE):
+        # Noise can still survive only when a strict customs signal exists.
+        strict_ok, strict_reason = strict_customs_gate(row)
+        if strict_ok:
+            return True, f"STRICT_OVERRIDES_NOISE:{strict_reason}"
+        return False, "GENERIC_ECONOMY_NOISE"
+
+    hits = [term for term in CONTEXTUAL_TRADE_TERMS if term in full]
+    if hits:
+        return True, ";".join(hits[:6])
+
+    # Existing policy signal + trade/import/export wording can be contextual evidence.
+    policy_signals = clean(row.get("PolicySignals", ""))
+    keyword_matches = clean(row.get("KeywordMatches", ""))
+    input_keyword = clean(row.get("InputKeyword", ""))
+
+    broad_text = f"{title} {full}"
+    broad_trade = contains_any(
+        broad_text,
+        ["trade", "import", "export", "무역", "통상", "수입", "수출"]
+    )
+
+    if broad_trade and (policy_signals or keyword_matches or input_keyword):
+        return True, "BROAD_TRADE_PLUS_POLICY_CONTEXT"
+
+    return False, "NO_CONTEXTUAL_TRADE_SIGNAL"
+
 
 POLICY_RULES = [
     ("AD_CVD", [
@@ -252,7 +471,14 @@ POLICY_RULES = [
     ("ORIGIN_FTA", ["fta", "cepa", "usmca", "rules of origin", "origin", "원산지", "자유무역협정"]),
     ("EXPORT_CONTROL", ["export control", "export controls", "sanction", "restriction", "수출통제", "제재"]),
     ("CBAM_CARBON", ["cbam", "carbon border", "carbon tariff", "탄소국경"]),
-    ("CUSTOMS", ["customs", "clearance", "declaration", "통관", "세관"]),
+    ("CUSTOMS", [
+        "customs", "clearance", "declaration", "customs valuation",
+        "manifestacion de valor", "manifestación de valor", "mve",
+        "de minimis", "small parcel", "low value consignment", "bonded warehouse",
+        "transshipment", "circumvention",
+        "통관", "세관", "가치신고", "가치선언", "소액", "소포장", "직구",
+        "면세", "보세창고", "우회수출", "불법수출",
+    ]),
     ("HS_CLASSIFICATION", ["hs code", "classification", "품목분류", "hs코드"]),
 ]
 
@@ -354,6 +580,65 @@ GTI_LOW_VALUE_CONTEXT = [
     "마약", "코카인", "필로폰", "밀수범", "금괴", "담배 밀수", "위조상품",
     "맛집", "축제", "관광", "도민체전", "체전", "야구", "축구", "범죄", "사기", "구속", "검거",
 ]
+
+HARD_SCOPE_EXCLUDE_TITLE_TERMS = [
+    # 범죄·마약 단속: 관세청이 등장해도 삼성전자 관세업무 보고 대상이 아님
+    "마약", "코카인", "필로폰", "합성대마", "대마초", "다크웹", "마약수사",
+    "drug bust", "drug seizure", "narcotics", "cocaine", "methamphetamine",
+    # 기술탈취·영업비밀·형사사건: 기술보호/법무 영역
+    "기술 탈취", "기술탈취", "기술 유출", "산업기술 유출", "영업비밀", "폭탄 증언",
+    "trade secret theft", "technology theft", "industrial espionage",
+    # 관세와 무관한 기업 재무·공공요금 이슈. 본문에 과거 tariff 표현이
+    # 있어도 Customs AI 검토 슬롯을 소비하지 않도록 제목 단계에서 차단.
+    "kepco", "한국전력", "전기요금", "전기 요금", "power bills", "power bill",
+    # 통관정책 변경이 아닌 개인통관번호 도용 통계·사건
+    "통관번호 도용", "개인통관고유부호 도용",
+]
+
+MACRO_NOISE_TITLE_TERMS = [
+    "인플레이션", "물가", "성장률", "수출 호황", "수출 증가", "일자리 전망",
+    "주가", "특징주", "실적", "경제 전망", "증시", "시황", "클라우드", "성장판",
+    "수주전", "공공 금융", "시장 점유율", "판매 호조",
+    "inflation", "economic growth", "stock price", "earnings", "market outlook",
+    "cloud growth", "market share", "sales growth",
+]
+
+CONCRETE_TITLE_ACTION_TERMS = [
+    "section 232", "section 301", "232조", "301조", "반덤핑", "상계관세",
+    "세이프가드", "예비판정", "최종판정", "조사 개시", "관세 부과", "관세 인상",
+    "수입금지", "수출통제", "원산지 규정", "통관절차 개정", "품목분류 결정",
+    "anti-dumping", "countervailing", "safeguard", "tariff imposed", "export control",
+]
+
+
+def is_hard_scope_excluded(row: pd.Series) -> bool:
+    title = clean(row.get("Headline", row.get("Title", ""))).lower()
+    if contains_any(title, HARD_SCOPE_EXCLUDE_TITLE_TERMS):
+        return True
+    if contains_any(title, MACRO_NOISE_TITLE_TERMS) and not contains_any(title, CONCRETE_TITLE_ACTION_TERMS):
+        return True
+    return False
+
+EVENT_ONLY_TERMS = [
+    "경진대회", "품목분류 경진", "실력 겨루", "겨룬다", "퀴즈대회", "공모전", "시상식",
+    "세미나", "웨비나", "설명회", "포럼", "컨퍼런스", "워크숍",
+    "contest", "competition", "seminar", "webinar", "conference", "workshop",
+]
+CONCRETE_MEASURE_TERMS = [
+    "시행", "발효", "부과", "인상", "인하", "폐지", "개정", "공포",
+    "조사 개시", "예비판정", "최종판정", "결정 고시", "명령", "고시",
+    "effective", "entered into force", "imposed", "amended",
+    "investigation initiated", "preliminary determination", "final determination",
+]
+
+
+def is_event_only_news(row: pd.Series) -> bool:
+    title = clean(row.get("Headline", row.get("Title", ""))).lower()
+    text = f"{analysis_text(row)} {clean(row.get('Country', ''))}".lower()
+    return (
+        any(term in title for term in EVENT_ONLY_TERMS)
+        and not any(term in text for term in CONCRETE_MEASURE_TERMS)
+    )
 
 # 오탐 문맥이어도 살릴 수 있는 강한 정책/무역 신호
 STRONG_POLICY_CONTEXT = [
@@ -506,6 +791,43 @@ def clean(value: object) -> str:
     return str(value).strip()
 
 
+def validate_required_news_inputs(paths: list[Path]) -> None:
+    """Fail closed when any collector output is missing, empty, unreadable or stale."""
+    failures = []
+    now_ts = datetime.now().timestamp()
+    for path in paths:
+        if not path.exists():
+            failures.append(f"MISSING:{path.name}")
+            continue
+        if path.stat().st_size <= 0:
+            failures.append(f"EMPTY_FILE:{path.name}")
+            continue
+        age_hours = max(0.0, (now_ts - path.stat().st_mtime) / 3600)
+        if age_hours > INPUT_MAX_AGE_HOURS:
+            failures.append(f"STALE:{path.name}:{age_hours:.1f}h")
+            continue
+        try:
+            probe = pd.read_excel(path, nrows=1)
+            if len(probe.columns) == 0:
+                failures.append(f"NO_COLUMNS:{path.name}")
+        except Exception as exc:
+            failures.append(f"UNREADABLE:{path.name}:{type(exc).__name__}")
+
+    if not failures:
+        log(f"INPUT COMPLETENESS OK: {len(paths)}/{len(paths)} files / max_age={INPUT_MAX_AGE_HOURS:g}h")
+        return
+
+    message = "NEWS INPUT INCOMPLETE: " + " | ".join(failures)
+    if ALLOW_MISSING_NEWS_INPUT:
+        log("WARNING " + message + " / override=GTI_ALLOW_MISSING_NEWS_INPUT=Y")
+        return
+    raise RuntimeError(
+        message + ". Run 2-1, 2-2 and 2-3 successfully before STEP3-2. "
+        "STEP3-2 did not create a new summary: DO NOT run STEP4-2 until all three collectors succeed. "
+        "Emergency override only: set GTI_ALLOW_MISSING_NEWS_INPUT=Y."
+    )
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -555,6 +877,9 @@ def is_false_positive_policy_news(row: pd.Series) -> bool:
         clean(row.get("Category", "")),
         clean(row.get("InputKeyword", "")),
     ]).lower()
+
+    if is_hard_scope_excluded(row) or is_event_only_news(row):
+        return True
 
     # Section 301/232, 반덤핑, FTA 등 강한 정책 신호가 있으면 보존
     if contains_any(text, STRONG_POLICY_CONTEXT):
@@ -645,6 +970,83 @@ def is_google_article_redirect_url(url: object) -> bool:
     if "news.google" not in host:
         return False
     return "/rss/articles/" in path or "/articles/" in path
+
+
+def _original_from_html(html_text: str, final_url: str) -> str:
+    """Extract a non-Google canonical/original article URL from a landing page."""
+    if not html_text:
+        return ""
+    soup = BeautifulSoup(html_text, "html.parser")
+    candidates = []
+    for tag, attr in [
+        (soup.find("link", rel=lambda v: v and "canonical" in str(v).lower()), "href"),
+        (soup.find("meta", property="og:url"), "content"),
+        (soup.find("meta", attrs={"name": "twitter:url"}), "content"),
+    ]:
+        if tag and tag.get(attr):
+            candidates.append(tag.get(attr))
+    for a in soup.find_all("a", href=True):
+        href = clean(a.get("href"))
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        for key in ["url", "q", "u"]:
+            if qs.get(key):
+                candidates.append(unquote(qs[key][0]))
+        if href.startswith("http"):
+            candidates.append(href)
+    candidates.append(final_url)
+    for candidate in candidates:
+        candidate = clean(candidate)
+        if candidate.startswith("http") and not is_google_unresolved_url(candidate):
+            return candidate
+    return ""
+
+
+def resolve_original_news_urls(df: pd.DataFrame) -> pd.DataFrame:
+    """Resolve only selected unresolved links; never replace a verified original URL."""
+    if df.empty:
+        return df
+    # Google News redirect resolution has repeatedly returned 0/120 while
+    # consuming more than two minutes. Keep the browser-safe Google article
+    # URL and let STEP4 extract the body. Explicit opt-in remains available.
+    if os.getenv("GTI_STEP3_RESOLVE_URL", "N").strip().upper() not in {"Y", "YES", "1", "TRUE"}:
+        log("ORIGINAL URL RESOLVE SKIP: GTI_STEP3_RESOLVE_URL=N / STEP4 body extraction will verify the article")
+        return df
+    out = df.copy()
+    unresolved = out.apply(
+        lambda r: is_google_unresolved_url(r.get("URL", ""))
+        or clean(r.get("URLQuality", "")) in {"GOOGLE_UNRESOLVED", "NEEDS_SELENIUM_RESOLVE"},
+        axis=1,
+    )
+    indices = list(out.index[unresolved])[:URL_RESOLVE_LIMIT]
+    resolved = 0
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36"}
+    for pos, idx in enumerate(indices, 1):
+        row = out.loc[idx]
+        google_url = clean(row.get("GoogleURL")) or clean(row.get("URL"))
+        original = ""
+        status = "RESOLVE_FAILED"
+        try:
+            response = requests.get(google_url, headers=headers, timeout=6, allow_redirects=True)
+            original = _original_from_html(response.text, response.url)
+            if original:
+                status = "ORIGINAL_RESOLVED_HTTP"
+        except Exception as exc:
+            status = f"RESOLVE_{type(exc).__name__}"
+        if original:
+            out.at[idx, "OriginalURLCandidate"] = original
+            out.at[idx, "BestLinkURL"] = original
+            out.at[idx, "URL"] = original
+            out.at[idx, "OriginalURLVerified"] = "Y"
+            out.at[idx, "URLQuality"] = "ORIGINAL_VERIFIED"
+            out.at[idx, "URLRestoreStatus"] = status
+            resolved += 1
+        else:
+            out.at[idx, "URLRestoreStatus"] = status
+        if pos % 25 == 0:
+            log(f"ORIGINAL URL RESOLVE: {pos}/{len(indices)} / resolved={resolved}")
+    log(f"ORIGINAL URL RESOLVE DONE: checked={len(indices)} / resolved={resolved} / unresolved={len(indices)-resolved}")
+    return out
 
 
 def choose_article_url(
@@ -841,7 +1243,11 @@ def load_one_file(path: Path) -> pd.DataFrame:
         log(f"input missing skip: {path.name}")
         return pd.DataFrame()
 
-    raw = normalize_columns(pd.read_excel(path))
+    try:
+        raw = normalize_columns(pd.read_excel(path))
+    except (zipfile.BadZipFile, ValueError, OSError) as exc:
+        log(f"input read failed skip: {path.name} / {type(exc).__name__}: {exc}")
+        return pd.DataFrame()
     if raw.empty:
         log(f"input empty: {path.name}")
         return pd.DataFrame()
@@ -943,7 +1349,7 @@ def is_major_tariff_regulation_news(row: pd.Series) -> bool:
 
 
 def regulation_related_flag(row: pd.Series) -> str:
-    return "Y" if is_major_tariff_regulation_news(row) else "N"
+    return "Y" if clean(row.get("CandidateGate", "")).upper() == "CORE" else "N"
 
 
 def classify_regulation_transfer_type(row: pd.Series) -> str:
@@ -989,19 +1395,77 @@ def remove_regulation_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def remove_old_data(df: pd.DataFrame, recent_hours: int) -> pd.DataFrame:
+    """
+    GTI v5.1 strict report-time filter.
+
+    Rule:
+    - STEP2 may collect 72 hours broadly.
+    - STEP3 report candidates are limited to the article PUBLISHED date/time.
+    - collected_at must NOT override an old published date.
+    - date_status='recent' must NOT bypass the actual 24h cutoff.
+    - Rows without a published date are excluded by default because their true age
+      cannot be proven. Set GTI_STEP3_ALLOW_COLLECTED_FALLBACK=Y only if needed.
+    """
     before = len(df)
-    cutoff = pd.Timestamp(datetime.now() - timedelta(hours=recent_hours))
-
     result = df.copy()
-    result["FilterDate"] = result["CollectedAt"]
-    result.loc[result["FilterDate"].isna(), "FilterDate"] = result.loc[result["FilterDate"].isna(), "Date"]
 
-    known = result["FilterDate"].notna()
-    recent = result["FilterDate"] >= cutoff
-    status_recent = result["date_status"].astype(str).str.lower().eq("recent") if "date_status" in result.columns else False
+    # Published/article date is the authoritative report date.
+    result["FilterDate"] = pd.to_datetime(result["Date"], errors="coerce")
+    result["FilterDateSource"] = "PUBLISHED"
 
-    result = result[(~known) | recent | status_recent].reset_index(drop=True)
-    log(f"최근 {recent_hours}시간 초과 제거: {before - len(result)}")
+    missing_date = result["FilterDate"].isna()
+    if ALLOW_COLLECTED_DATE_FALLBACK:
+        result.loc[missing_date, "FilterDate"] = pd.to_datetime(
+            result.loc[missing_date, "CollectedAt"], errors="coerce"
+        )
+        result.loc[missing_date & result["FilterDate"].notna(), "FilterDateSource"] = "COLLECTED_FALLBACK"
+    else:
+        result.loc[missing_date, "FilterDateSource"] = "NO_PUBLISHED_DATE"
+
+    recent, normalized_dates, window_start, window_end = previous_kst_day_mask(result["FilterDate"])
+    result["FilterDate"] = normalized_dates
+
+    # gti_report_window may return KST-normalized wall-clock values as a
+    # tz-naive Series while the window boundaries remain tz-aware.  Pandas
+    # deliberately rejects comparisons between those two representations.
+    # Align only the diagnostic boundaries to the representation returned for
+    # FilterDate; the authoritative inclusion mask above is left unchanged.
+    filter_tz = getattr(result["FilterDate"].dt, "tz", None)
+    window_start_ts = pd.Timestamp(window_start)
+    window_end_ts = pd.Timestamp(window_end)
+    if filter_tz is None:
+        if window_start_ts.tzinfo is not None:
+            window_start_for_count = window_start_ts.tz_localize(None)
+            window_end_for_count = window_end_ts.tz_localize(None)
+        else:
+            window_start_for_count = window_start_ts
+            window_end_for_count = window_end_ts
+    else:
+        if window_start_ts.tzinfo is None:
+            window_start_for_count = window_start_ts.tz_localize(filter_tz)
+            window_end_for_count = window_end_ts.tz_localize(filter_tz)
+        else:
+            window_start_for_count = window_start_ts.tz_convert(filter_tz)
+            window_end_for_count = window_end_ts.tz_convert(filter_tz)
+
+    valid_date = result["FilterDate"].notna()
+    old_count = int((valid_date & (result["FilterDate"] < window_start_for_count)).sum())
+    no_date_count = int((~valid_date).sum())
+    future_count = int((valid_date & (result["FilterDate"] >= window_end_for_count)).sum())
+
+    result = result[recent].reset_index(drop=True)
+
+    log(
+        f"KST PRIOR-DAY published-date filter: "
+        f"{before} -> {len(result)} / old_removed={old_count} / "
+        f"no_date_removed={no_date_count} / future_removed={future_count}"
+    )
+    log(f"report window: {window_start} <= published < {window_end}")
+    if not result.empty:
+        log(
+            f"report date range: "
+            f"{result['FilterDate'].min()} ~ {result['FilterDate'].max()}"
+        )
     return result
 
 
@@ -1050,25 +1514,98 @@ def add_signals(df: pd.DataFrame, keywords: list[str]) -> pd.DataFrame:
         item["PolicySignals"] = "; ".join(policy_signals)
         item["SamsungSignal"] = "; ".join(samsung_signals) if samsung_signals else "None"
         item["IssueKey"] = policy_signals[0] if policy_signals else "TRADE_GENERAL"
+
+        strict_ok, strict_reason = strict_customs_gate(pd.Series(item))
+        contextual_ok, contextual_reason = contextual_trade_gate(pd.Series(item))
+
+        if strict_ok:
+            item["CustomsGateFlag"] = "Y"
+            item["CustomsGateReason"] = strict_reason
+            item["CandidateGate"] = "CORE"
+        elif contextual_ok:
+            item["CustomsGateFlag"] = "C"
+            item["CustomsGateReason"] = contextual_reason
+            item["CandidateGate"] = "CONTEXTUAL"
+        else:
+            item["CustomsGateFlag"] = "N"
+            item["CustomsGateReason"] = contextual_reason
+            item["CandidateGate"] = "REJECT"
+
         rows.append(item)
 
     return pd.DataFrame(rows)
 
 
 def filter_relevant_news(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    GTI v5.3 balanced filtering:
+    - CORE: explicit customs/tariff/FTA/AD-CVD/export-control etc.
+    - CONTEXTUAL: trade-policy context worth Gemini review.
+    - REJECT: generic economy/industry/news noise.
+    """
     before = len(df)
-    rows = []
+    if df.empty:
+        return df
 
-    for _, row in df.iterrows():
-        keyword_ok = bool(clean(row.get("KeywordMatches", "")))
-        policy_ok = bool(clean(row.get("PolicySignals", "")))
-        input_keyword_ok = bool(clean(row.get("InputKeyword", "")))
+    work = df.copy()
 
-        if keyword_ok or policy_ok or input_keyword_ok:
-            rows.append(row)
+    core_mask = work["CandidateGate"].astype(str).eq("CORE")
+    contextual_mask = work["CandidateGate"].astype(str).eq("CONTEXTUAL")
 
-    result = pd.DataFrame(rows)
-    log(f"뉴스 키워드/정책 신호 선별: {len(result)} / 제거: {before - len(result)}")
+    core = work[core_mask].copy()
+    contextual = work[contextual_mask].copy()
+
+    log(
+        f"BALANCED gate prefilter: CORE={len(core)} / "
+        f"CONTEXTUAL={len(contextual)} / "
+        f"TopicScoreColumn={'Y' if 'TopicScore' in contextual.columns else 'N'}"
+    )
+
+    # Contextual items need a minimum policy/topic score; avoid generic export statistics.
+    if not contextual.empty:
+        topic_score_series = (
+            pd.to_numeric(contextual["TopicScore"], errors="coerce").fillna(0)
+            if "TopicScore" in contextual.columns
+            else pd.Series(0, index=contextual.index, dtype="float64")
+        )
+
+        policy_signal_series = (
+            contextual["PolicySignals"].fillna("").astype(str).str.strip()
+            if "PolicySignals" in contextual.columns
+            else pd.Series("", index=contextual.index, dtype="object")
+        )
+
+        keyword_match_series = (
+            contextual["KeywordMatches"].fillna("").astype(str).str.strip()
+            if "KeywordMatches" in contextual.columns
+            else pd.Series("", index=contextual.index, dtype="object")
+        )
+
+        contextual = contextual[
+            (topic_score_series >= 35)
+            | policy_signal_series.ne("")
+            | keyword_match_series.ne("")
+        ].copy()
+
+    result = pd.concat([core, contextual], ignore_index=True)
+
+    # Never let generic economy-only rows survive.
+    if not result.empty:
+        result = result[
+            ~result.apply(
+                lambda r: (
+                    contains_any(analysis_text(r), GENERIC_ECONOMY_NOISE)
+                    and clean(r.get("CandidateGate", "")) != "CORE"
+                ),
+                axis=1,
+            )
+        ].copy()
+
+    log(
+        f"BALANCED customs/trade gate: {before} -> {len(result)} "
+        f"/ CORE={len(core)} / CONTEXTUAL={len(contextual)} "
+        f"/ removed={before-len(result)}"
+    )
     return result.reset_index(drop=True)
 
 
@@ -1134,6 +1671,9 @@ def has_product_samsung_signal(samsung: object) -> bool:
 
 def infer_samsung_impact(row: pd.Series) -> str:
     """Direct/Indirect impact flag for Samsung-facing Top30 selection."""
+    if is_event_only_news(row):
+        return "Reference"
+
     country_text = clean(row.get("Country", ""))
     issue = clean(row.get("IssueKey", ""))
     samsung = clean(row.get("SamsungSignal", ""))
@@ -1144,11 +1684,22 @@ def infer_samsung_impact(row: pd.Series) -> str:
     product_signal = has_product_samsung_signal(samsung)
     high_policy = issue in {"TARIFF", "AD_CVD", "EXPORT_CONTROL", "CBAM_CARBON", "ORIGIN_FTA", "HS_CLASSIFICATION"}
 
-    # Direct는 삼성 명시 또는 '생산/판매국가 + 삼성 관련 제품군 + 고위험 정책'일 때만 부여
-    # 생산국가 단독 + 일반 tariff 기사까지 Direct로 잡히던 과대 산정을 방지한다.
-    if "SAMSUNG_MENTION" in signals:
-        return "Direct"
-    if direct_country and product_signal and high_policy:
+    text = analysis_text(row).lower()
+    customs_action = contains_any(text, [
+        "관세", "tariff", "section 232", "section 301", "반덤핑", "상계관세",
+        "anti-dumping", "countervailing", "원산지", "환적", "transshipment",
+        "customs", "통관", "수출통제", "export control", "제재", "sanction",
+        "fta", "certificate of origin", "cbam", "hs code", "품목분류",
+    ])
+    # STEP3 Direct 후보도 4개 축을 모두 요구한다: 삼성 명시 + 제품 + 법인국가 + 조치.
+    # 국가/제품/관세 키워드의 단순 동시 출현만으로 Direct를 만들지 않는다.
+    if (
+        "SAMSUNG_MENTION" in signals
+        and product_signal
+        and direct_country
+        and customs_action
+        and high_policy
+    ):
         return "Direct"
     if product_signal or high_policy or "PRODUCTION_COUNTRY" in signals:
         return "Indirect"
@@ -1162,27 +1713,47 @@ def calculate_topic_score(row: pd.Series) -> int:
 
     if is_major_tariff_regulation_news(row):
         base += 6
-    base += min(keyword_count * 2, 10)
-    return max(0, min(int(base), 100))
+    base += min(keyword_count, 6)
+    # 3단계에서는 순위 후보만 만들며 대부분을 100점으로 만들지 않는다.
+    return max(0, min(int(base), 92))
 
 
 def calculate_samsung_impact_score(row: pd.Series) -> int:
+    """
+    Secondary ranking score only.
+    CORE customs candidates can score high.
+    CONTEXTUAL trade-policy candidates remain available for Gemini but are capped.
+    """
+    gate = clean(row.get("CandidateGate", "")).upper()
+    if gate == "REJECT" or not gate:
+        return 0
+
     impact = clean(row.get("SamsungImpact", ""))
-    samsung = clean(row.get("SamsungSignal", ""))
-    signals = set(samsung_signal_parts(samsung))
+    signals = set(samsung_signal_parts(row.get("SamsungSignal", "")))
+    issue = clean(row.get("IssueKey", ""))
 
     if impact == "Direct":
-        score = 100
+        score = 78
     elif impact == "Indirect":
-        score = 72
+        score = 55
     else:
-        score = 35
+        score = 25
 
-    product_signals = signals.intersection({"SEMICONDUCTOR", "MOBILE", "BATTERY", "DISPLAY", "SAMSUNG_MENTION"})
-    if product_signals:
-        score += min(len(product_signals) * 4, 12)
+    if "SAMSUNG_MENTION" in signals:
+        score += 8
+
+    product_signals = signals.intersection({"SEMICONDUCTOR", "MOBILE", "BATTERY", "DISPLAY"})
+    score += min(len(product_signals) * 4, 12)
+
+    if issue in {"TARIFF","AD_CVD","EXPORT_CONTROL","ORIGIN_FTA","HS_CLASSIFICATION","CUSTOMS","CBAM_CARBON"}:
+        score += 7
+
     if "PRODUCTION_COUNTRY" in signals:
-        score += 4
+        score += 2
+
+    # Contextual rows are review candidates, not automatically high-impact.
+    if gate == "CONTEXTUAL":
+        score = min(score, 72)
 
     return max(0, min(int(score), 100))
 
@@ -1191,9 +1762,15 @@ def calculate_risk_score(row: pd.Series) -> int:
     risk = clean(row.get("Risk", ""))
     issue = clean(row.get("IssueKey", ""))
     score = RISK_SCORE_MAP.get(risk, 40)
+    text = analysis_text(row).lower()
+    official_action = contains_any(text, [
+        "시행", "발효", "부과", "조사 개시", "조사개시", "판정", "고시", "공고",
+        "effective", "entered into force", "impose", "investigation", "determination",
+        "official", "court", "ruling", "executive order",
+    ])
     if issue in {"EXPORT_CONTROL", "AD_CVD", "TARIFF"} and risk == "상":
-        score = 100
-    return max(0, min(int(score), 100))
+        score = 85 if official_action else 68
+    return max(0, min(int(score), 90))
 
 
 def calculate_final_score(row: pd.Series) -> int:
@@ -1415,7 +1992,7 @@ def best_link_for_dedup(row: pd.Series) -> str:
 def dedup_news(df: pd.DataFrame) -> pd.DataFrame:
     """Two-pass de-duplication.
 
-    v3.4 fix:
+    v5.11 fix:
     - Keep GoogleURL/BestLinkURL for mail links.
     - Do not let unique Google RSS article IDs prevent duplicate removal.
     - After URL de-dup, always run title_norm de-dup across all rows.
@@ -1447,27 +2024,189 @@ def dedup_news(df: pd.DataFrame) -> pd.DataFrame:
     log(f"뉴스 중복 제거: {before - len(result)}")
     return result
 
+def canonical_event_signature(row: pd.Series) -> str:
+    """Cross-publisher event identity: actor/target + instrument + product.
+
+    This intentionally ignores publisher wording and percentage formatting.
+    It only returns a key when at least three anchors are present, preventing
+    broad items such as 'global tariffs' from collapsing unrelated events.
+    """
+    text = " ".join([
+        clean(row.get("Headline", "")), clean(row.get("Summary", "")),
+        clean(row.get("Description", "")), clean(row.get("Country", "")),
+    ]).lower()
+    country_groups = {
+        "US": ["미국", "美", "u.s.", "united states", "usa"],
+        "CN": ["중국", "中", "china", "chinese"],
+        "EU": ["유럽연합", "eu", "european union"],
+        "IN": ["인도", "india"], "VN": ["베트남", "vietnam"],
+        "KR": ["한국", "대한민국", "korea"],
+        "CA": ["캐나다", "canada"], "IE": ["아일랜드", "ireland", "irish"],
+        "MX": ["멕시코", "mexico"], "ID": ["인도네시아", "indonesia"],
+        "LA": ["라오스", "laos"],
+    }
+    instrument_groups = {
+        "AD": ["반덤핑", "anti-dumping", "antidumping"],
+        "CVD": ["상계관세", "countervailing"],
+        "SG": ["세이프가드", "safeguard"],
+        "S232": ["section 232", "232조", "무역확장법 232"],
+        "S301": ["section 301", "301조"],
+        "EXPORT_CONTROL": ["수출통제", "export control", "entity list"],
+        "ORIGIN": ["원산지", "rules of origin", "certificate of origin", "coo"],
+        "CUSTOMS": ["통관", "세관", "customs", "de minimis"],
+        "TARIFF": ["관세", "tariff", "duty"],
+    }
+    product_groups = {
+        "SEMICON": ["반도체", "semiconductor", "chip", "h200"],
+        "SOLAR": ["태양광", "solar cell", "solar cells", "photovoltaic"],
+        "STEEL": ["철강", "h형강", "특수강", "steel"],
+        "AUTO": ["자동차", "vehicle", "car"],
+        "DRONE": ["드론", "drone", "uas"],
+        "WHISKEY": ["위스키", "whiskey", "whisky"],
+        "CHEMICAL": ["화학", "chemical", "폴리실리콘", "polysilicon"],
+        "LOW_VALUE": ["저가소포", "저가 수입", "low-value", "de minimis"],
+    }
+    countries = sorted(k for k, terms in country_groups.items() if any(x in text for x in terms))
+    if re.search(r"\bus\b", text) and "US" not in countries:
+        countries.append("US")
+        countries.sort()
+    instrument = next((k for k, terms in instrument_groups.items() if any(x in text for x in terms)), "")
+    product = next((k for k, terms in product_groups.items() if any(x in text for x in terms)), "")
+    action = ""
+    action_groups = {
+        "INIT": ["조사 개시", "investigation initiated", "initiation"],
+        "PRELIM": ["예비판정", "preliminary determination"],
+        "FINAL": ["최종판정", "final determination"],
+        "IMPOSE": ["부과", "impose", "levy"],
+        "LIFT": ["철회", "폐지", "제거", "lift", "remove", "eliminate"],
+        "AMEND": ["개정", "변경", "amend", "change"],
+        "PROPOSE": ["제안", "검토", "계획", "propose", "consider", "plan"],
+    }
+    action = next((k for k, terms in action_groups.items() if any(x in text for x in terms)), "")
+    if countries and instrument and product:
+        return f"event|{'+'.join(countries)}|{instrument}|{product}|{action or 'SIGNAL'}".lower()
+    return ""
+
+
 def make_issue_cluster_key(row: pd.Series) -> str:
+    """
+    v5.3 event cluster:
+    same issue + same major policy/product/rate anchor -> same cluster.
+    Avoids collapsing unrelated tariff stories into one global cluster.
+    """
     issue = clean(row.get("IssueKey", "")) or "TRADE_GENERAL"
+    canonical = canonical_event_signature(row)
+    if canonical:
+        return canonical
+    text = f"{analysis_text(row)} {clean(row.get('Country', ''))}".lower()
+    title_text = clean(row.get("Headline", "")).lower()
+
+    if (
+        any(x in text for x in ["미국", "트럼프", "백악관", "washington", "u.s."])
+        and any(x in title_text for x in ["삼성전자", "삼전", "samsung", "sk하이닉스", "하이닉스", "반도체", "semiconductor", "chip"])
+        and any(x in text for x in ["관세", "tariff", "투자 압박", "투자 이행", "미국 투자", "유치 압박", "양자택일", "편 서지 마", "pressure"])
+    ):
+        return f"{issue}|semantic|US_SEMICON_TARIFF_INVESTMENT_PRESSURE".lower()
+    if (
+        any(x in text for x in ["미국", "트럼프", "u.s."])
+        and any(x in title_text for x in ["드론", "drone", "무인기", "uas"])
+        and any(x in text for x in ["100%", "100％", "최대 100", "section 232", "232조"])
+        and any(x in text for x in ["관세", "tariff"])
+    ):
+        return f"{issue}|semantic|US_DRONE_232_TARIFF".lower()
+
+    # 의미 기반 핵심 사건 앵커. 언론사·표현·번역이 달라도 동일 사건은 하나로 묶는다.
+    semantic_events = [
+        ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [
+            ["전략물자수출입고시", "전략물자 수출입고시"],
+            ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"],
+        ]),
+        ("KR_CHINA_BUTYL_ACRYLATE_AD", [
+            ["아크릴산 부틸", "butyl acrylate"],
+            ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"],
+            ["중국", "china", "chinese"],
+        ]),
+        ("US_KR_COUPANG_SECTION301_TARIFF", [
+            ["쿠팡", "coupang"],
+            ["301조", "section 301", "추가 관세", "관세 보복", "retaliatory tariff"],
+        ]),
+        ("KR_HOLIDAY_ORIGIN_MARKING_ENFORCEMENT", [
+            ["추석", "명절"],
+            ["원산지표시", "국산 둔갑", "원산지 표시"],
+            ["단속", "관세청"],
+        ]),
+        ("G20_TRADE_IMBALANCE_CHINA", [
+            ["g20"], ["무역 불균형", "trade imbalance"], ["중국", "china"],
+        ]),
+        ("EU_LOW_VALUE_DEMINIMIS_2026", [
+            ["eu", "유럽연합"], ["저가", "low-value", "de minimis", "150유로"],
+            ["3유로", "€3", "면세 폐지", "tariff", "관세"],
+        ]),
+        ("US_CANADA_50PCT_RETALIATORY_TARIFFS", [
+            ["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"], ["캐나다", "canada"],
+            ["관세", "tariff"],
+        ]),
+        ("KR_FLOOD_CUSTOMS_RELIEF", [
+            ["호우", "침수", "수해", "flood"],
+            ["관세", "세관", "customs", "납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"],
+        ]),
+        ("US_SECTION232_DRONE_COMPONENTS_TARIFF", [
+            ["드론", "drone", "무인기", "uas"],
+            ["section 232", "무역확장법 232", "232조"],
+            ["관세", "tariff"],
+        ]),
+        ("US_CHINA_TRANSSHIPMENT_KOREA_SEMICON", [
+            ["환적", "transshipment", "원산지 세탁", "관세 회피"],
+            ["한국", "korea", "경기", "semiconductor belt", "반도체벨트"],
+            ["중국", "china", "중국산"],
+        ]),
+        ("US_CHINA_AUTO_TARIFF_BLOCK", [
+            ["중국차", "중국산 자동차", "chinese car", "chinese vehicle"],
+            ["127.5%", "딜러", "dealer", "봉쇄", "진입 반대"],
+        ]),
+        ("KR_STEEL_TRADE_REMEDY", [
+            ["한국산 철강", "한국 철강", "korean steel", "k철강"],
+            ["반덤핑", "anti-dumping", "232", "쿼터", "관세"],
+        ]),
+        ("BUSAN_EXPORT_ECONOMY", [["부산"], ["제조업", "수출 중심", "실물경제"]]),
+        ("EU_CHINA_AUTO_SUPPLY_CHAIN", [
+            ["유럽", "europe", "eu"], ["중국차", "chinese car", "부품망", "공급망"],
+        ]),
+    ]
+    for event_name, groups in semantic_events:
+        if all(any(term in text for term in group) for group in groups):
+            return f"{issue}|semantic|{event_name}".lower()
+
+    policy_anchor = ""
+    for term in EVENT_POLICY_TERMS:
+        if term in text:
+            policy_anchor = term
+            break
+
+    product_anchor = ""
+    for term in EVENT_PRODUCT_TERMS:
+        if term in text:
+            product_anchor = term
+            break
+
+    pct = ""
+    m = re.search(r'(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%', text)
+    if m:
+        pct = f"{m.group(1)}%"
+
     country = clean(row.get("Country", "")) or "Global"
+
+    # Strong event signature.
+    if policy_anchor or product_anchor or pct:
+        return f"{issue}|{policy_anchor}|{product_anchor}|{pct}|{country}".lower()
+
+    # Fallback: normalized title tokens, more specific than previous v5.2.
     title = normalize_issue_title(row.get("Headline", ""))
-    tokens = title.split()
-
-    anchor_terms = []
-    for term in [
-        "cepa", "usmca", "fta", "tariff", "tariffs", "duty", "customs",
-        "anti", "dumping", "countervailing", "export", "control", "cbam",
-        "관세", "수출", "수입", "무역", "원산지", "반덤핑", "품목분류", "제재",
-    ]:
-        if term in title:
-            anchor_terms.append(term)
-
-    if anchor_terms:
-        base = " ".join(anchor_terms[:6])
-    else:
-        base = " ".join(tokens[:8])
-
-    return f"{issue}|{country}|{base}".lower()
+    tokens = [
+        tok for tok in title.split()
+        if tok not in {"the","a","an","and","or","of","to","on","in","for","with","from"}
+    ]
+    return f"{issue}|{country}|{' '.join(tokens[:10])}".lower()
 
 
 def title_similarity(a: object, b: object) -> float:
@@ -1546,14 +2285,50 @@ def cluster_policy_events(df: pd.DataFrame) -> pd.DataFrame:
     result["IssueClusterKey"] = result.apply(make_issue_cluster_key, axis=1)
     result = result.sort_values(["FinalScore", "FilterDate"], ascending=[False, False]).reset_index(drop=True)
 
-    # Previous near-similarity clustering compared each row with many representatives.
-    # With large daily candidate pools this can run for hours.  Use the deterministic
-    # issue key as the primary grouping key; title-level dedup already ran earlier.
-    compressed_rows = []
+    # Keep multiple strong articles per policy cluster. STEP3-2 is a candidate
+    # pool builder; reducing every policy cluster to one article can collapse
+    # 1,500+ collected articles into only a few candidates. Title/URL dedup has
+    # already removed true duplicates, so retain up to 3 high-quality articles
+    # per issue cluster for downstream AI ranking.
+    CLUSTER_KEEP = max(1, int(os.getenv("GTI_STEP3_CLUSTER_KEEP", "1")))
+    kept_rows = []
     for _, group in result.groupby("IssueClusterKey", sort=False, dropna=False):
-        compressed_rows.append(compress_cluster(group.copy()))
+        group = group.copy()
+        group["_strong_title"] = group.apply(
+            lambda r: 1 if has_title_keyword(r) else 0, axis=1
+        )
+        group["_official_source"] = group.apply(source_priority, axis=1)
+        group = group.sort_values(
+            [
+                "_strong_title", "SamsungImpactScore", "_official_source",
+                "FinalScore", "TopicScore", "FilterDate"
+            ],
+            ascending=[False, False, False, False, False, False],
+        ).copy()
+        cluster_size = len(group)
+        sources = []
+        headlines = []
+        for _, r in group.iterrows():
+            agency = clean(r.get("Agency", "")) or clean(r.get("Publisher", "")) or clean(r.get("SourceFile", ""))
+            if agency and agency not in sources:
+                sources.append(agency)
+            headline = clean(r.get("Headline", ""))
+            if headline and headline not in headlines:
+                headlines.append(headline)
+        for _, r in group.head(CLUSTER_KEEP).iterrows():
+            item = r.to_dict()
+            item["ClusterSize"] = cluster_size
+            item["DuplicateCount"] = max(cluster_size - 1, 0)
+            item["ClusterSources"] = "; ".join(sources[:12])
+            item["ClusterHeadlines"] = " | ".join(headlines[:8])
+            item["IssueClusterKey"] = make_issue_cluster_key(r)
+            item["RepresentativeReason"] = (
+                f"cluster candidate: FinalScore={int(r.get('FinalScore', 0) or 0)}, "
+                f"ClusterSize={cluster_size}, retained={CLUSTER_KEEP}, event_key={make_issue_cluster_key(r)}"
+            )
+            kept_rows.append(item)
 
-    compressed = pd.DataFrame(compressed_rows)
+    compressed = pd.DataFrame(kept_rows)
     if compressed.empty:
         log(f"정책 이슈 clustering 제거: {before} / 대표기사=0")
         return compressed
@@ -1629,7 +2404,6 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
             score >= 70
             and (product_samsung or score >= 80)
             and issue in ["TARIFF", "AD_CVD", "EXPORT_CONTROL", "CBAM_CARBON", "ORIGIN_FTA"]
-            and title_keyword
             and not unresolved_google
             and not standalone_noise
         ):
@@ -1689,10 +2463,13 @@ def enforce_tier_buckets(df: pd.DataFrame) -> pd.DataFrame:
 
     result["risk_order"] = result["Risk"].map(risk_order).fillna(0)
     result["tier_order"] = result["Tier"].map(preliminary_tier_order).fillna(0)
+    # Title keyword is a supporting signal only. Do not let it outrank Samsung
+    # customs impact, policy importance, risk, and final score.
     result["title_keyword_order"] = result.apply(lambda r: 1 if has_title_keyword(r) else 0, axis=1)
+    result["samsung_direct_order"] = result["SamsungImpact"].map({"Direct": 3, "Indirect": 2, "Reference": 1}).fillna(0)
 
-    sort_cols = ["title_keyword_order", "tier_order", "risk_order", "FinalScore", "TopicScore", "SamsungImpactScore", "FilterDate"]
-    result = result.sort_values(sort_cols, ascending=[False, False, False, False, False, False, False]).reset_index(drop=True)
+    sort_cols = ["tier_order", "samsung_direct_order", "risk_order", "FinalScore", "SamsungImpactScore", "TopicScore", "title_keyword_order", "FilterDate"]
+    result = result.sort_values(sort_cols, ascending=[False, False, False, False, False, False, False, False]).reset_index(drop=True)
 
     core_end = min(TIER_CORE_LIMIT, len(result))
     usable_end = min(core_end + TIER_USABLE_LIMIT, len(result))
@@ -1705,7 +2482,6 @@ def enforce_tier_buckets(df: pd.DataFrame) -> pd.DataFrame:
     core_candidates = [
         idx for idx, row in result.iterrows()
         if clean(row.get("TierOriginal", "")) == "CORE"
-        and has_title_keyword(row)
         and clean(row.get("URLRestoreStatus", "")) not in {"GOOGLE_UNRESOLVED", "NEEDS_SELENIUM_RESOLVE", "GOOGLE_ARTICLE_REDIRECT"}
         and not has_standalone_noise_signal(row)
     ]
@@ -1735,6 +2511,77 @@ def enforce_tier_buckets(df: pd.DataFrame) -> pd.DataFrame:
         f"REFERENCE={int(result['Tier'].eq('REFERENCE').sum())}"
     )
     return result
+
+
+
+def ensure_candidate_floor(filtered_df: pd.DataFrame, prefilter_df: pd.DataFrame, floor: int = 0) -> pd.DataFrame:
+    """
+    Safety against catastrophic collapse.
+    If strict/contextual filtering leaves too few rows, restore the best contextual
+    trade-policy candidates only (never obvious noise) up to floor.
+    """
+    # 보고 품질이 목적이므로 건수를 맞추기 위한 일반뉴스 복원을 하지 않는다.
+    if floor <= 0 or len(filtered_df) >= floor or prefilter_df.empty:
+        return filtered_df
+
+    existing_keys = set()
+    for _, r in filtered_df.iterrows():
+        existing_keys.add(
+            normalize_url(r.get("BestLinkURL", "") or r.get("URL", ""))
+            or clean(r.get("Headline", "")).lower()
+        )
+
+    pool = prefilter_df.copy()
+    if "CandidateGate" in pool.columns:
+        pool = pool[pool["CandidateGate"].astype(str).eq("CORE")].copy()
+
+    if "IssueKey" in pool.columns:
+        pool = pool[pool["IssueKey"].astype(str).isin([
+            "TARIFF", "AD_CVD", "EXPORT_CONTROL", "CBAM_CARBON",
+            "ORIGIN_FTA", "HS_CLASSIFICATION", "CUSTOMS"
+        ])].copy()
+
+    # Never revive a row merely to satisfy volume.
+    pool = pool[pool.apply(has_title_keyword, axis=1)].copy()
+
+    if not pool.empty:
+        pool = pool[
+            ~pool.apply(
+                lambda r: contains_any(analysis_text(r), GENERIC_ECONOMY_NOISE)
+                and clean(r.get("CandidateGate", "")) != "CORE",
+                axis=1,
+            )
+        ].copy()
+
+    # rank by topic/source/policy evidence, not Samsung mention
+    for c in ["TopicScore", "RiskScore", "ImportanceScore"]:
+        if c not in pool.columns:
+            pool[c] = 0
+        pool[c] = pd.to_numeric(pool[c], errors="coerce").fillna(0)
+
+    pool["_restore_score"] = (
+        pool["TopicScore"] * 0.55
+        + pool["RiskScore"] * 0.25
+        + pool["ImportanceScore"] * 0.20
+    )
+    pool = pool.sort_values("_restore_score", ascending=False, kind="stable")
+
+    additions = []
+    for _, r in pool.iterrows():
+        key = normalize_url(r.get("BestLinkURL", "") or r.get("URL", "")) or clean(r.get("Headline", "")).lower()
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        additions.append(r)
+        if len(filtered_df) + len(additions) >= floor:
+            break
+
+    if additions:
+        result = pd.concat([filtered_df, pd.DataFrame(additions)], ignore_index=True, sort=False)
+        log(f"CANDIDATE FLOOR RESTORE: {len(filtered_df)} -> {len(result)}")
+        return result.drop(columns=["_restore_score"], errors="ignore")
+
+    return filtered_df
 
 
 def finalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -1781,6 +2628,9 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
     final["KeywordMatches"] = result["KeywordMatches"]
     final["TitleKeywordFlag"] = result.get("TitleKeywordFlag", "")
     final["TitleKeywordMatches"] = result.get("TitleKeywordMatches", "")
+    final["CustomsGateFlag"] = result.get("CustomsGateFlag", "")
+    final["CustomsGateReason"] = result.get("CustomsGateReason", "")
+    final["CandidateGate"] = result.get("CandidateGate", "")
     final["OriginalURLVerified"] = result.get("OriginalURLVerified", "")
     final["URLQuality"] = result.get("URLQuality", "")
     final["IssueClusterKey"] = result.get("IssueClusterKey", "")
@@ -1956,6 +2806,70 @@ def has_headline_and_link(row: pd.Series) -> bool:
     return False
 
 
+
+def remove_historical_duplicates(df: pd.DataFrame, cumulative_file: Path) -> pd.DataFrame:
+    """Remove only duplicates reported before today.
+
+    Articles already written to cumulative during an earlier run *today* must
+    remain eligible for today's summary.  Otherwise a same-day rerun turns a
+    healthy candidate set into only a few rows.  Previous calendar-day rows
+    still suppress repeats, so the normal daily report remains duplicate-free.
+    """
+    if df.empty or not cumulative_file.exists():
+        return df
+    try:
+        old = standardize_cumulative_columns(pd.read_excel(cumulative_file, engine="openpyxl"))
+    except Exception as exc:
+        log(f"WARN historical duplicate check skipped: {type(exc).__name__}: {exc}")
+        return df
+
+    now_ts = pd.Timestamp(datetime.now())
+    run_day = now_ts.date()
+    fresh_cutoff = now_ts - pd.Timedelta(hours=RECENT_HOURS)
+    # CollectedAt identifies the reporting run.  Fall back to publication Date
+    # only for legacy cumulative files that do not contain a usable timestamp.
+    seen_dates = pd.to_datetime(old.get("CollectedAt", pd.Series(index=old.index, dtype=object)), errors="coerce")
+    publish_dates = pd.to_datetime(old.get("Date", pd.Series(index=old.index, dtype=object)), errors="coerce")
+    seen_dates = seen_dates.where(seen_dates.notna(), publish_dates)
+    # 자정을 넘겨 재실행해도 최근 24시간 기사는 과거 중복으로 제거하지 않는다.
+    fresh_window_mask = publish_dates.ge(fresh_cutoff)
+    same_day_mask = (
+        seen_dates.dt.date.eq(run_day)
+        | fresh_window_mask.fillna(False)
+    )
+    same_day_count = int(same_day_mask.fillna(False).sum())
+    historical = old.loc[~same_day_mask.fillna(False)].copy()
+
+    old_urls = {make_merge_key(r) for _, r in historical.iterrows() if make_merge_key(r)}
+    old_titles = {make_title_source_key(r) for _, r in historical.iterrows() if make_title_source_key(r)}
+    before = len(df)
+    kept = []
+    for _, row in df.iterrows():
+        url_key = ""
+        for col in ["OriginalURLCandidate","BestLinkURL","URL","GoogleURL"]:
+            if col in row.index:
+                url_key = normalize_url(row.get(col,""))
+                if url_key:
+                    break
+        headline = clean(row.get("Headline","")).lower()
+        source = clean(row.get("Source","") or row.get("Publisher","") or row.get("Agency","")).lower()
+        nh = re.sub(r"\s+"," ",re.sub(r"[^0-9a-z가-힣一-龥ぁ-ゔァ-ヴー\s]"," ",headline)).strip()
+        ns = re.sub(r"\s+"," ",re.sub(r"[^0-9a-z가-힣一-龥ぁ-ゔァ-ヴー\s]"," ",source)).strip()
+        ts_key = f"{ns}|{nh}" if nh else ""
+        if url_key and url_key in old_urls:
+            continue
+        if ts_key and ts_key in old_titles:
+            continue
+        kept.append(row)
+    result = pd.DataFrame(kept)
+    log(
+        "cumulative historical duplicate removed: "
+        f"{before - len(result)} / new candidates={len(result)} / "
+        f"same-day protected={same_day_count} / historical compared={len(historical)}"
+    )
+    return result.reset_index(drop=True)
+
+
 def update_cumulative(final_df: pd.DataFrame, cumulative_file: Path) -> pd.DataFrame:
     new_df = standardize_cumulative_columns(final_df)
     before_required = len(new_df)
@@ -2079,7 +2993,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="STEP3-2 news merge")
     parser.add_argument("--output", type=Path, default=OUTPUT_FILE)
     parser.add_argument("--cumulative", type=Path, default=CUMULATIVE_FILE)
-    parser.add_argument("--hours", type=int, default=RECENT_HOURS)
+    parser.add_argument("--hours", type=int, default=RECENT_HOURS, help="Strict published-date report window; default 24h")
     parser.add_argument("--min-score", type=int, default=MIN_SCORE)
     return parser.parse_args()
 
@@ -2089,9 +3003,10 @@ def main() -> None:
     global MIN_SCORE
     MIN_SCORE = args.min_score
 
-    log("STEP3-2 NEWS MERGE START")
+    log("GTI v5.14 STEP3-2 KST PRIOR-DAY IDENTITY START")
 
     keywords = load_keywords()
+    validate_required_news_inputs(INPUT_FILES)
     df = load_data(INPUT_FILES)
     df = remove_regulation_rows(df)
     df = remove_old_data(df, args.hours)
@@ -2099,10 +3014,49 @@ def main() -> None:
     df = add_signals(df, keywords)
     df = filter_relevant_news(df)
     df = add_analysis_fields(df)
+    df = resolve_original_news_urls(df)
     df = dedup_news(df)
+
+    # Keep a post-dedup prefilter pool for catastrophic-collapse recovery.
+    prefilter_pool = df.copy()
+
+    df = remove_historical_duplicates(df, args.cumulative)
+
+    # If cumulative comparison leaves too few rows, do not restore historical duplicates.
+    # Candidate floor recovery only uses already-new rows from the current run.
+    new_only_pool = df.copy()
+
     df = cluster_policy_events(df)
 
+    floor_target = int(os.getenv("GTI_STEP3_CANDIDATE_FLOOR", "0"))
+    df = ensure_candidate_floor(df, new_only_pool, floor=floor_target)
+
+    # Final safety guard: never pass an article older than the report window.
+    if "FilterDate" in df.columns:
+        before_final_age_guard = len(df)
+        final_mask, _, final_start, final_end = previous_kst_day_mask(df["FilterDate"])
+        df = df[final_mask].copy()
+        log(
+            f"FINAL KST PRIOR-DAY guard removed: {before_final_age_guard - len(df)} / "
+            f"window={final_start} <= Date < {final_end}"
+        )
+
     final_df = finalize(df)
+
+    # GTI v5.2 FILE-BOUNDARY HARD GUARD:
+    # even if any later ranking/bucket logic changes rows, an old article can never
+    # be written to 3-2.news_summary.xlsx.
+    if not final_df.empty:
+        before_file_guard = len(final_df)
+        file_mask, _, file_start, file_end = previous_kst_day_mask(final_df["Date"])
+        final_df = final_df[file_mask].copy().reset_index(drop=True)
+        if "Priority" in final_df.columns:
+            final_df["Priority"] = range(1, len(final_df) + 1)
+        log(
+            f"FILE-BOUNDARY KST PRIOR-DAY guard: {before_file_guard} -> {len(final_df)} / "
+            f"window={file_start} <= Date < {file_end}"
+        )
+
     if not final_df.empty:
         title_kw_count = int(final_df["TitleKeywordFlag"].astype(str).str.upper().eq("Y").sum()) if "TitleKeywordFlag" in final_df.columns else 0
         original_verified_count = int(final_df["OriginalURLVerified"].astype(str).str.upper().eq("Y").sum()) if "OriginalURLVerified" in final_df.columns else 0
@@ -2118,12 +3072,10 @@ def main() -> None:
     write_excel(args.output, final_df, "news_summary")
     write_excel(args.cumulative, cumulative_df, "news_cumulative")
 
-    log(f"STEP3-2 COMPLETE: summary={len(final_df)} rows / cumulative={len(cumulative_df)} rows")
+    log(f"GTI v5.14 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
     log(f"SAVE: {args.output}")
     log(f"SAVE: {args.cumulative}")
 
 
 if __name__ == "__main__":
     main()
-
-

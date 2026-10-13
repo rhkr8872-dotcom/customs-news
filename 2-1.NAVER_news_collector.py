@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
-print("🚀 GTI STEP2 NAVER NEWS-ONLY PRIORITY BALANCED VERSION START")
+print("🚀 GTI v5.0 STEP2-1 NAVER BROAD NEWS COLLECTION START")
 
 # =============================
 # PATH
@@ -58,7 +58,8 @@ HEADERS = {
 # =============================
 LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "72"))
 NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "100"))
-MIN_SAVE_PRIORITY = int(os.getenv("GTI_MIN_SAVE_PRIORITY", "50"))
+MIN_SAVE_PRIORITY = int(os.getenv("GTI_MIN_SAVE_PRIORITY", "0"))
+COLLECTION_MODE = os.getenv("GTI_STEP2_BROAD_COLLECTION", "Y").strip().upper()
 REQUEST_SLEEP_SEC = float(os.getenv("GTI_NAVER_SLEEP_SEC", "0.1"))
 
 # STEP2는 후보 수집 단계이므로 과도하게 줄이지 않는다.
@@ -363,8 +364,13 @@ def should_keep_article(title, description, keyword, priority):
     """
     text = f"{title} {description}"
 
-    if len(title) < 10:
+    if len(title) < 5:
         return False, "short_title"
+
+    # v5.0: STEP2 is collection-only. Relevance/industry/noise decisions
+    # belong to STEP3, so do not prematurely discard trade/economic articles.
+    if COLLECTION_MODE == "Y":
+        return True, "broad_collection"
 
     if is_stock_noise(text):
         return False, "stock_noise"
@@ -490,7 +496,7 @@ def collect_naver(keyword_df):
 
         time.sleep(REQUEST_SLEEP_SEC)
 
-    print(f"🟢 NAVER collected after balanced filter: {len(results)}")
+    print(f"🟢 NAVER broad candidates collected: {len(results)}")
     return results
 
 # =============================

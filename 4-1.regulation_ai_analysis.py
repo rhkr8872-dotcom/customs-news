@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-# GTI FINAL CORE v5 - Gemini regulation analysis, LAW1 only
 """
-GTI STEP4-1 LAW1-ONLY REGULATION AI ANALYSIS - GUARDRAIL v4.1
+GTI STEP4-1 REGULATION AI ANALYSIS - GUARDRAIL v4.1
 
 Fixes
 - Exclude stale regulations/notices older than GTI_STEP4_REG_MAX_AGE_DAYS (default 90).
@@ -23,12 +22,16 @@ from datetime import datetime
 from urllib.parse import quote, unquote, urlparse
 
 import pandas as pd
+from gti_report_window import previous_kst_day_mask
 
 BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
-INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"  # generated only from 1-1.regulation_raw.xlsx
+INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"
+FALLBACK_INPUT_FILE = BASE_DIR / "3-1.regulation_summary.xlsx"
 KEYWORD_FILE = BASE_DIR / "keyword.xlsx"
 OUT_SUMMARY = BASE_DIR / "4-1.regulation_ai_summary.xlsx"
+MAX_AGE_HOURS = int(os.getenv("GTI_STEP4_REG_MAX_AGE_HOURS", "24"))
 OUT_CUMULATIVE = BASE_DIR / "4-1.regulation_ai_cumulative.xlsx"
+OUT_CUMULATIVE_REMOVED = BASE_DIR / "4-1.regulation_ai_cumulative_removed.xlsx"
 OUT_EXCLUDED = BASE_DIR / "4-1.regulation_ai_excluded.xlsx"
 
 MAX_AGE_DAYS = int(os.getenv("GTI_STEP4_REG_MAX_AGE_DAYS", "90"))
@@ -42,24 +45,32 @@ EVENT_NOISE_TERMS = [
     "registration", "tender", "call for tender", "rfp", "expo", "opening ceremony", "ceremony", "join the upcoming",
     "live streaming",
     "웨비나", "세미나", "컨퍼런스", "서밋", "워크숍", "교육", "강의", "설명회", "포럼", "입찰", "공모", "행사", "참가신청",
+    "마약", "밀수", "특별검사팀", "현장 점검",
+    "thúc đẩy hợp tác hải quan", "đối thoại hải quan", "phiên đối thoại",
+    "sơ bộ tình hình xuất nhập khẩu", "bắt giữ", "giả nhãn hiệu", "lịch bảo trì hệ thống",
 ]
 TOPIC_RULES = [
-    ("AD_CVD", ["anti-dumping", "anti dumping", "antidumping", "countervailing", "countervailing duty", "countervailing duties", "ad/cvd", "cvd", "dumping duties", "반덤핑", "덤핑방지관세", "상계관세", "무역구제"]),
+    ("AD_CVD", ["anti-dumping", "anti dumping", "antidumping", "countervailing", "countervailing duty", "countervailing duties", "ad/cvd", "cvd", "dumping duties", "반덤핑", "덤핑방지관세", "덤핑사실", "국내산업피해", "산업피해구제", "불공정무역행위", "조사개시결정", "상계관세", "무역구제"]),
     ("EXPORT_CONTROL", ["export control", "export controls", "entity list", "denied persons", "bureau of industry and security", "수출통제", "전략물자", "제재", "산업안보국", "산업보안국"]),
     ("CBAM_CARBON", ["cbam", "carbon border", "carbon border adjustment", "탄소국경"]),
     ("ORIGIN_FTA", ["fta", "cepa", "usmca", "rules of origin", "origin", "원산지", "자유무역협정", "tepa"]),
     ("HS_CLASSIFICATION", ["hs code", "classification", "tariff classification", "품목분류", "hs코드"]),
+    ("CUSTOMS_EDI", ["납세신고 정정", "수입신고 정정", "신고 정정", "전자문서 변경", "전자신고 변경", "5fe", "5fk"]),
+    ("FX_TRADE_PAYMENT", ["외국환거래규정", "외국환 신고", "수출입대금", "지급 및 영수", "상계 신고"]),
     ("TARIFF", ["section 301", "301조", "section 232", "232조", "reciprocal tariff", "tariff", "tariffs", "customs duty", "import duty", "관세", "관세율", "추가관세", "상호관세"]),
     ("CUSTOMS", ["customs", "clearance", "declaration", "통관", "세관", "관세청"]),
 ]
-TOPIC_KR = {"EXPORT_CONTROL":"수출통제", "AD_CVD":"반덤핑/상계관세", "CBAM_CARBON":"CBAM", "ORIGIN_FTA":"FTA/원산지", "HS_CLASSIFICATION":"HS/품목분류", "TARIFF":"관세정책", "CUSTOMS":"통관/세관", "TRADE_GENERAL":"무역일반"}
+TOPIC_KR = {"EXPORT_CONTROL":"수출통제", "AD_CVD":"반덤핑/상계관세", "CBAM_CARBON":"CBAM", "ORIGIN_FTA":"FTA/원산지", "HS_CLASSIFICATION":"HS/품목분류", "TARIFF":"관세정책", "CUSTOMS":"통관/세관", "CUSTOMS_EDI":"수입신고/전자문서", "FX_TRADE_PAYMENT":"수출입 외국환", "TRADE_GENERAL":"무역일반"}
 
 STRICT_TRADE_REG_TERMS = [
     "관세", "관세율", "관세청", "통관", "세관", "보세", "수입신고", "수출신고",
     "품목분류", "hs code", "hs코드", "원산지", "fta", "자유무역협정", "cepa",
     "anti-dumping", "antidumping", "countervailing", "ad/cvd", "반덤핑", "덤핑방지관세",
+    "덤핑사실", "국내산업피해", "산업피해구제", "불공정무역행위", "조사개시결정",
     "상계관세", "무역구제", "수출통제", "전략물자", "entity list", "cbam", "carbon border",
     "customs", "tariff", "tariffs", "customs duty", "import duty", "section 301", "section 232",
+    "외국환거래규정", "외국환 신고", "수출입대금", "지급 및 영수",
+    "납세신고 정정", "수입신고 정정", "전자문서 변경", "전자신고 변경", "5fe", "5fk",
 ]
 
 SOFT_TRADE_REG_TERMS = [
@@ -75,6 +86,7 @@ CONCRETE_TRADE_REG_TERMS = [
     "anti-dumping", "antidumping", "countervailing", "ad/cvd", "tariff", "customs duty",
     "import duty", "rules of origin", "hs code", "classification",
     "수입", "수출", "원산지", "관세", "반덤핑", "상계관세", "무역구제", "세이프가드",
+    "외국환거래규정", "수출입대금", "납세신고 정정", "수입신고 정정", "전자문서 변경", "5fe", "5fk",
 ]
 
 GENERIC_NOTICE_ONLY_TERMS = {"notice", "public notice", "regulation", "law", "act", "decree", "공고", "고시"}
@@ -95,8 +107,9 @@ PURE_REGULATION_TERMS = [
     "trade notice", "federal register", "determination under", "investigation", "anti-dumping",
     "antidumping", "countervailing", "customs duty", "import duty", "export obligation",
     "법", "법률", "법령", "시행령", "시행규칙", "규칙", "고시", "공고", "훈령", "예규",
-    "행정규칙", "입법예고", "행정예고", "덤핑방지관세", "상계관세", "무역구제",
+    "행정규칙", "입법예고", "행정예고", "덤핑방지관세", "덤핑사실", "국내산업피해", "조사개시결정", "상계관세", "무역구제",
     "관세율", "관세법", "보세", "통관", "수출입고시", "수입규제", "수출규제",
+    "외국환거래규정", "납세신고 정정", "수입신고 정정", "전자문서 변경", "5fe", "5fk",
 ]
 
 LEGAL_FORM_TITLE_TERMS = [
@@ -104,6 +117,7 @@ LEGAL_FORM_TITLE_TERMS = [
     "trade notice", "federal register", "determination under", "investigation",
     "법", "법률", "법령", "시행령", "시행규칙", "규칙", "고시", "공고", "훈령", "예규",
     "행정규칙", "입법예고", "행정예고", "덤핑방지관세", "상계관세", "무역구제", "지급요령",
+    "외국환거래규정", "전자문서 변경", "납세신고 정정", "수입신고 정정",
 ]
 
 POLICY_NOTICE_NOISE_TERMS = [
@@ -148,6 +162,41 @@ OUTPUT_COLS = [
     "No", "Content Type", "Mail Group", "Samsung Impact", "Affected Subsidiary", "Impact Reason", "Date", "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "Agency", "Risk", "Importance Score", "Priority Group", "Issue", "Cluster", "URL", "Source", "Source File", "RejectReason", "KeywordMatches", "effective_date_hint", "hs_hint", "tariff_rate_hint"
 ]
 
+REGULATION_HARD_NOISE_TERMS = [
+    "직제 시행규칙", "직제 일부개정", "그 소속기관 직제", "소속기관 직제",
+    "직제 (행정관련", "직제(행정관련", "조직개편", "기구 개편", "정원 일부개정",
+    "외국인청고시", "국적상실", "철도교통관제센터", "한국수출입은행법", "선박안전법",
+]
+
+def is_official_trade_policy_candidate(row: pd.Series) -> bool:
+    if clean(row.get("OfficialPolicyFlag", "")).upper() == "Y":
+        return True
+    headline = clean(row.get("Headline", row.get("title", ""))).lower()
+    owner = " ".join([
+        clean(row.get("Agency", row.get("agency", ""))),
+        clean(row.get("Source", row.get("source", ""))),
+    ]).lower()
+    agency_ok = any(x in owner for x in ["dgft", "cbic", "customs", "ustr", "usitc", "mofcom", "gacc", "taxud"])
+    action_ok = any(x in headline for x in [
+        "amendment in the export policy", "amendment in export policy",
+        "amendment in the import policy", "amendment in import policy",
+        "export policy of", "import policy of", "trade notice",
+    ])
+    return agency_ok and action_ok
+CUMULATIVE_REMOVED_DF = pd.DataFrame()
+for _quality_col in [
+    "Top3 Eligible", "Body Verified", "Change Type", "Evidence", "Missing Facts",
+    "RegulationMappingType", "MappingStatus", "RequiredMappingKeys", "EntityDirectFlag",
+    "SamsungRelevanceScore", "CustomsTradePolicyScore", "DirectImpactScore", "WeightedScore",
+    "DecisionStatus", "PriorityEligible", "Policy Stage", "BillNo", "DocumentIdentity", "EventKey",
+    "OriginalDateStatus", "DateSource", "CustomsOperationalWatchFlag",
+    "EvidenceStatus", "WhatChanged", "PolicyStageDisplay", "EffectiveDate",
+    "AffectedProduct", "AffectedHS", "SamsungImpactPath", "RecommendedAction",
+    "VerificationNeeded", "OfficialURL",
+]:
+    if _quality_col not in OUTPUT_COLS:
+        OUTPUT_COLS.append(_quality_col)
+
 
 
 # ======================================================================
@@ -155,7 +204,7 @@ OUTPUT_COLS = [
 # ======================================================================
 
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 USE_GEMINI = os.getenv("GTI_STEP4_USE_GEMINI", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
 ARTICLE_FETCH_TIMEOUT = int(os.getenv("GTI_ARTICLE_FETCH_TIMEOUT", "12"))
 ARTICLE_MAX_CHARS = int(os.getenv("GTI_ARTICLE_MAX_CHARS", "12000"))
@@ -349,21 +398,36 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
         body, status = fetch_article_body_for_ai(url)
 
     prompt = f"""
-당신은 삼성전자 본사 관세/통상 리스크 분석가입니다.
-아래 원문을 읽고 GTI Radar 임원보고용으로 분석하십시오.
+당신은 삼성전자 본사 관세·통상 및 관세컴플라이언스 책임자입니다.
+아래 공식 법규/공고의 원문만 근거로 GTI Radar 의사결정 보고서를 작성하십시오.
+
+분석 순서(반드시 준수):
+1) 사실관계: 문서명, 발표기관·국가, 신규/개정/시행/조사 단계, 발표일·시행일, 대상 품목·HS, 세율·쿼터, 신고·증빙 요건을 원문 근거로 정리.
+2) 삼성전자 관세업무 직접영향: 수입·수출통관, HS, 과세가격, 원산지/FTA, AD/CVD, 관세비용, 수출통제 중 실제로 바뀌는 업무와 영향 법인·제품·거래 흐름을 설명.
+3) 대응: 즉시(오늘~3영업일), 1개월 내, 상시 모니터링 및 Owner를 분리.
+
+Direct 판정 조건:
+- 삼성전자 법인이 소재한 국가의 일반 통관·신고·납부·증빙·세관조사·심판청구·이의신청·행정절차 변경은 해당 국가 법인에 Direct.
+- 특정품목의 관세율·HS·AD/CVD·원산지·수출통제 조치는 삼성 제품/원재료 + HS + 영향 법인 + 수출입 경로가 1:1로 확인될 때만 Direct.
+- 국가명, 산업명, 삼성/반도체 단어만으로 Direct 금지. 불명확하면 Indirect 또는 Watch.
 
 절대 금지:
-- 제목 반복 금지
-- "관련 뉴스입니다", "공식 규제/공지 후보입니다" 같은 템플릿 문장 금지
-- 본문에 없는 세율/HS/국가/시행일을 지어내지 말 것
-- 본문을 읽을 수 없으면 Summary에 "본문 확인 불가"라고 명시
+- 제목 반복, 일반론, 모든 법인에 동일한 문구 사용 금지
+- 원문에 없는 세율·HS·국가·시행일·대상제품을 추정하거나 지어내지 말 것
+- 본문을 읽을 수 없으면 body_verified=false, Samsung Impact=Watch, Top3 Eligible=false
 
 출력은 JSON만:
 {{
-  "Summary": "원문 기준 게시물 요약 2~3줄",
-  "AI Analysis": "삼성전자 관세업무 영향. 수입통관/수출통관/FTA·원산지/HS/관세비용/수출통제 중 해당 항목을 구체적으로 설명",
-  "Action Plan": "즉시조치/1주 내/1개월 내/Owner 형식의 구체적 대응방안",
-  "ExecutiveMessage": "임원용 한 문단 핵심 메시지"
+  "Summary": "[사실관계] 원문 근거 3~5문장. 신규/개정 구분과 적용일 포함",
+  "AI Analysis": "[삼성전자 관세업무 직접영향] 영향 경로·법인·제품·업무·비용/리스크를 근거와 함께 4~7문장",
+  "Action Plan": "[즉시] ... | [1개월 내] ... | [상시] ... | [Owner] ...",
+  "ExecutiveMessage": "무엇이 바뀌며 삼성전자 관세업무가 무엇을 결정해야 하는지 2문장",
+  "Samsung Impact": "Direct|Indirect|Watch",
+  "Top3 Eligible": false,
+  "body_verified": true,
+  "change_type": "신규|개정|시행|조사개시|판정|기타",
+  "evidence": ["원문 근거1", "원문 근거2"],
+  "missing_facts": ["원문에서 확인되지 않은 필수정보"]
 }}
 
 기본 정보:
@@ -431,6 +495,11 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
 
 def log(msg): print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}")
 def clean(v): return "" if pd.isna(v) else str(v).strip()
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return clean(value).lower() in {"1", "true", "yes", "y"}
 def contains_any(text, terms):
     t = str(text or "").lower()
     return any(term.lower() in t for term in terms)
@@ -683,8 +752,95 @@ def action_for(topic):
     if topic == "CBAM_CARBON": return "ESG/구매/통관", "CBAM 대상 품목, 공급사 탄소자료, EU 신고 증빙 체계를 점검하십시오."
     if topic == "ORIGIN_FTA": return "FTA팀", "원산지 기준·CO 발급·수입 FTA 적용 및 증빙자료 영향을 확인하십시오."
     if topic == "HS_CLASSIFICATION": return "HS/통관팀", "품목분류 기준 변경 및 HS Master 영향 여부를 확인하십시오."
+    if topic == "CUSTOMS_EDI": return "통관운영/관세시스템", "수입(납세)신고 정정 전자문서와 관세사·EDI 인터페이스 변경일을 확인하고 신고 테스트 및 SOP를 갱신하십시오."
+    if topic == "FX_TRADE_PAYMENT": return "HQ관세/재무/외환", "수출입대금 지급·영수·상계·제3자 지급 신고요건과 증빙 및 ERP 지급 프로세스 영향을 확인하십시오."
     if topic == "TARIFF": return "통관운영/FTA팀", "관세율·시행일·대상국·대상품목을 확인하고 원가 영향을 점검하십시오."
     return "통관운영", "업무 관련성 확인 후 모니터링하십시오."
+
+def guard_unverified_dates(analysis: dict, row: pd.Series) -> dict:
+    """Remove dates asserted by AI when they are absent from extracted evidence."""
+    result = dict(analysis or {})
+    evidence_text = " ".join([
+        clean(row.get("article_body", "")), clean(row.get("regulation_fallback_body", "")),
+        clean(result.get("Evidence", "")),
+    ])
+    verified = clean(result.get("Body Verified", "N")).upper() == "Y"
+    evidence_dates = set(re.findall(r"(?:20\d{2})[-년./ ]+\s*(?:0?[1-9]|1[0-2])[-월./ ]+\s*(?:0?[1-9]|[12]\d|3[01])", evidence_text))
+    if verified and evidence_dates:
+        return result
+    for field in ["Summary", "AI Analysis", "Action Plan"]:
+        value = clean(result.get(field, ""))
+        if not value:
+            continue
+        value = re.sub(
+            r"20\d{2}년\s*\d{1,2}월\s*\d{1,2}일(?:부터|자로)?\s*(?:시행|발효|적용|공포)(?:될\s*)?(?:예정입니다|예정이다|됩니다|된다|되었습니다|되었다)?[.]?",
+            "구체적인 시행·발효일은 원문 확인이 필요합니다.", value,
+        )
+        value = value.replace("필요합니다.예정이며", "필요합니다.")
+        value = value.replace("필요합니다. 예정이며", "필요합니다.")
+        value = value.replace("필요합니다.,", "필요합니다.")
+        value = value.replace("필요합니다..", "필요합니다.")
+        result[field] = value
+    return result
+
+
+def enforce_unverified_evidence_contract(
+    analysis: dict, row: pd.Series, *, issue: str, headline: str
+) -> dict:
+    """Replace all unsupported narrative when the regulation body is unverified.
+
+    Partial regex cleanup is unsafe because a model can express dates, periods,
+    rates or product scope in many forms.  For Body Verified=N, retain only
+    title/metadata facts and explicitly list the facts that still require the
+    official body or amendment comparison table.
+    """
+    result = dict(analysis or {})
+    if clean(result.get("Body Verified", "N")).upper() == "Y":
+        return result
+
+    agency = clean(row.get("Agency", row.get("agency", ""))) or "공식기관"
+    issue_name = clean(issue) or "관세·통상 법규"
+    is_strategic = issue_name == "수출통제" or any(
+        term in clean(headline).lower()
+        for term in ["전략물자", "수출통제", "export control", "entity list"]
+    )
+    result["Summary"] = (
+        f"{agency}의 '{headline}'가 게시되었습니다. 제목상 {issue_name} 관련 공식 법규·고시 후보입니다. "
+        "원문 본문이 확보되지 않아 구체적인 개정내용, 대상 품목, HS/ECCN, 시행·발효일, "
+        "적용기간 및 신고·허가 요건은 확인되지 않았습니다. 해당 정보는 공식 원문과 개정 전후표 확인 후 확정해야 합니다."
+    )
+    if is_strategic:
+        result["AI Analysis"] = (
+            "전략물자·수출통제 변경은 삼성전자 제품, 부품, 제조장비 및 해외 거래의 허가·스크리닝 업무에 "
+            "중대한 영향을 줄 수 있으므로 긴급 원문확인 대상입니다. 다만 현재는 대상 품목, ECCN/전략물자 번호, "
+            "영향 법인과 거래경로가 확인되지 않아 Direct 영향으로 확정할 수 없습니다. 원문 확인 전에는 "
+            "기존 통제기준을 유지하고 신규 지정·삭제 및 허가요건 변경 여부를 우선 점검해야 합니다."
+        )
+        result["Action Plan"] = (
+            "즉시: 공식 원문과 개정 전후표를 확보하여 통제대상 품목, 전략물자 번호/ECCN, 허가·신고요건 및 시행일을 확인합니다. "
+            "| 1주 내: 확인된 변경사항을 삼성전자 Item Master, 수출통제 판정, 거래상대방·최종사용자 스크리닝과 대조합니다. "
+            "| 상시: 영향 법인과 사업부에 확정된 변경사항만 배포합니다. | Owner: HQ 수출통제·관세팀"
+        )
+    else:
+        result["AI Analysis"] = (
+            f"{issue_name} 관련 공식 조치 후보로서 삼성전자 관세업무 영향 가능성은 있으나, 원문과 적용범위가 "
+            "확인되지 않아 제품·HS·법인·거래경로의 직접 영향을 확정할 수 없습니다. 원문 검증과 실제 거래 매핑이 "
+            "완료될 때까지 Watch로 관리해야 합니다."
+        )
+        result["Action Plan"] = (
+            "즉시: 공식 원문과 개정 전후표를 확보하여 변경내용과 시행일을 확인합니다. "
+            "| 1개월 내: 확인된 품목·HS·요건을 삼성전자 거래 및 Master Data와 대조합니다. "
+            "| 상시: 원문 미확인 정보는 업무지침으로 배포하지 않습니다. | Owner: 관세·통상팀"
+        )
+    result["Evidence"] = ""
+    result["Missing Facts"] = (
+        "공식 원문 본문; 개정 전후표; 대상 품목/HS/ECCN; 시행·발효일; 적용기간; "
+        "신고·허가·증빙요건; 삼성전자 영향 법인 및 거래경로"
+    )
+    result["Samsung Impact"] = "Watch"
+    result["Top3 Eligible"] = "N"
+    result["Change Type"] = "기타"
+    return result
 
 def score_row(row):
     text = row_text(row)
@@ -702,12 +858,15 @@ def score_row(row):
     policy_briefing_news = is_policy_briefing_press_release(row)
     unipass_notice_force = is_unipass_notice_candidate(row)
     indirect_tax_law_force = is_indirect_customs_tax_law(row, text) and not policy_briefing_news
-    forced_customs_trade_regulation = unipass_notice_force or indirect_tax_law_force
+    official_trade_policy_force = is_official_trade_policy_candidate(row)
+    forced_customs_trade_regulation = unipass_notice_force or indirect_tax_law_force or official_trade_policy_force
     strict_trade_signal = has_strict_trade_reg_signal(text, row) or metadata_trade_signal or forced_customs_trade_regulation
     old_ad_cvd_review = is_old_ad_cvd_review(topic, text, age_days)
-    pure_regulation = is_pure_regulation_candidate(row, text, topic)
+    pure_regulation = is_pure_regulation_candidate(row, text, topic) or official_trade_policy_force
 
     if not is_valid_url(url): rejects.append("no_valid_url")
+    if contains_any(headline.lower(), REGULATION_HARD_NOISE_TERMS):
+        rejects.append("organization_or_non_customs_hard_noise")
     if age_days is not None and age_days > MAX_AGE_DAYS:
         rejects.append(f"old_regulation>{MAX_AGE_DAYS}d")
         if old_ad_cvd_review:
@@ -727,7 +886,7 @@ def score_row(row):
     if topic == "TRADE_GENERAL" and not keyword_hits and not metadata_trade_signal:
         rejects.append("weak_trade_policy_signal")
 
-    base_map = {"EXPORT_CONTROL":100,"AD_CVD":96,"CBAM_CARBON":90,"ORIGIN_FTA":88,"HS_CLASSIFICATION":86,"TARIFF":84,"CUSTOMS":74,"TRADE_GENERAL":72 if keyword_hits else 30}
+    base_map = {"EXPORT_CONTROL":100,"AD_CVD":96,"CBAM_CARBON":90,"ORIGIN_FTA":88,"HS_CLASSIFICATION":86,"CUSTOMS_EDI":90,"FX_TRADE_PAYMENT":86,"TARIFF":84,"CUSTOMS":74,"TRADE_GENERAL":72 if keyword_hits else 30}
     base = base_map.get(topic, 30)
     if age_days is None and metadata_trade_signal:
         recency = 85
@@ -742,6 +901,8 @@ def score_row(row):
             keyword_hits.append("UNIPASS_NOTICE_FORCE_INCLUDE")
         if indirect_tax_law_force:
             keyword_hits.append("INDIRECT_CUSTOMS_TAX_LAW")
+        if official_trade_policy_force:
+            keyword_hits.append("OFFICIAL_TRADE_POLICY")
     if keyword_hits and not rejects:
         score = max(score, 72)
     if rejects:
@@ -749,10 +910,10 @@ def score_row(row):
             score = min(score, 55)
         else:
             score = min(score, 45 if "event_training_tender_noise" in rejects else 50)
-    selected = not rejects and score >= MIN_SCORE
     owner, action = action_for(topic)
     risk = "상" if score >= 85 else "중" if score >= 70 else "하"
     issue = TOPIC_KR.get(topic, topic)
+    selected = not rejects and score >= MIN_SCORE
     impact = "Watch" if selected else "Reference"
     products_text = clean(row.get("affected_products", "")) or "본문에서 확인 불가"
     analysis = build_gti_ai_analysis(
@@ -765,12 +926,94 @@ def score_row(row):
         default_action=action,
         content_type="Regulation",
     )
-    return {"selected": selected, "RejectReason": "; ".join(rejects), "Issue": issue, "topic": topic, "score": score, "Risk": risk, "URL": url, "Headline": headline, "Date": clean(date_val), "Agency": clean(row.get("Agency", row.get("agency", ""))), "Source": clean(row.get("Source", row.get("source", ""))), "Summary": analysis.get("Summary", ""), "AI Analysis": analysis.get("AI Analysis", ""), "Action Plan": analysis.get("Action Plan", action), "Owner": owner, "KeywordMatches": "; ".join(keyword_hits[:12]), "tariff_rate_hint": extract_tariff_rate(text), "effective_date_hint": clean(row.get("effective_date_hint", "본문에서 확인 불가")) or "본문에서 확인 불가", "hs_hint": clean(row.get("hs_hint", "본문에서 확인 불가")) or "본문에서 확인 불가", "article_extract_status": analysis.get("article_extract_status", "")}
+    analysis = guard_unverified_dates(analysis, row)
+    analysis = enforce_unverified_evidence_contract(
+        analysis, row, issue=issue, headline=headline
+    )
+    mapping_type = clean(row.get("RegulationMappingType", "POLICY_GENERAL")) or "POLICY_GENERAL"
+    if mapping_type == "ITEM_1TO1":
+        mapping_type = "PRODUCT_1TO1"
+    elif mapping_type == "ENTITY_COUNTRY":
+        mapping_type = "POLICY_GENERAL"
+    selected = not rejects and (score >= MIN_SCORE or mapping_type == "PRODUCT_1TO1")
+    body_ok = clean(analysis.get("Body Verified", "N")).upper() == "Y"
+    hs_value = clean(row.get("hs_hint", ""))
+    product_value = clean(row.get("affected_products", row.get("Product", "")))
+    entity_value = clean(row.get("Affected Subsidiary", row.get("SamsungEntity", "")))
+    route_value = clean(row.get("ImportExportRoute", row.get("TradeRoute", "")))
+    item_mapped = all(v and "확인 불가" not in v for v in [hs_value, product_value, entity_value, route_value])
+
+    # HS/AD-CVD/product measures always require product-level mapping even when
+    # STEP3 supplied a legacy POLICY_GENERAL value.
+    if topic in {"AD_CVD", "HS_CLASSIFICATION", "EXPORT_CONTROL", "CBAM_CARBON"}:
+        mapping_type = "PRODUCT_1TO1"
+    if hs_value and "확인 불가" not in hs_value:
+        mapping_type = "PRODUCT_1TO1"
+
+    ai_impact = clean(analysis.get("Samsung Impact", "Watch")) or "Watch"
+    mapping_status = clean(row.get("MappingStatus", "POLICY_REVIEW")) or "POLICY_REVIEW"
+    if mapping_type == "ENTITY_DIRECT" and body_ok:
+        ai_impact = "Direct"
+        mapping_status = "ENTITY_CONFIRMED"
+    elif mapping_type == "PRODUCT_1TO1":
+        if body_ok and item_mapped:
+            ai_impact = "Direct"
+            mapping_status = "MAPPED"
+        else:
+            ai_impact = "Watch"
+            mapping_status = "MAPPING_REQUIRED" if body_ok else "VERIFICATION_PENDING"
+    else:
+        # Hypothetical language such as "if Samsung trades this product" is
+        # not an indirect-impact mapping.  Keep general policy at Watch until
+        # an actual Samsung entity/product/HS/trade route is evidenced.
+        ai_impact = "Watch"
+        mapping_status = "POLICY_REVIEW"
+
+    policy_score = max(0, min(100, int(score)))
+    direct_score = 100 if ai_impact == "Direct" else 65 if ai_impact == "Indirect" else 35
+    samsung_relevance = 100 if mapping_status in {"ENTITY_CONFIRMED", "MAPPED"} else 50
+    weighted_score = round(policy_score * 0.4 + direct_score * 0.4 + samsung_relevance * 0.2)
+    # A verified, high-materiality customs regulation must reach the executive
+    # verification queue even when Samsung entity/product mapping is pending.
+    # This does not relax the Direct gate: Direct still requires evidence-backed
+    # entity/product/route mapping above.
+    high_materiality = body_ok and policy_score >= 85
+    top3 = "Y" if (body_ok and ai_impact == "Direct" and weighted_score >= 80) or high_materiality else "N"
+    if not body_ok:
+        decision_status = "Verification Pending"
+    elif ai_impact == "Direct":
+        decision_status = "Action Required"
+    elif high_materiality:
+        decision_status = "Urgent Verification"
+    else:
+        decision_status = "Monitoring"
+
+    headline_low = headline.lower()
+    proposed = any(x in headline_low for x in [
+        "법률안", "입법예고", "행정예고", "proposal", "proposed", "draft",
+    ])
+    policy_stage = "PROPOSED_OR_MONITORING" if proposed else "ENACTED_OR_EFFECTIVE"
+    bill_no = clean(row.get("BillNo", ""))
+    document_identity = clean(row.get("DocumentIdentity", ""))
+    source_event_key = clean(row.get("EventKey", ""))
+    if document_identity:
+        source_event_key = document_identity.lower()
+    elif bill_no:
+        source_event_key = f"bill:{bill_no.split('.')[0]}"
+
+    effective_hint = clean(row.get("effective_date_hint", ""))
+    if not any(x in " ".join([clean(row.get("article_body", "")), clean(row.get("regulation_fallback_body", "")), clean(analysis.get("Evidence", ""))]).lower() for x in ["시행", "적용", "발효", "effective", "takes effect", "enters into force"]):
+        effective_hint = "본문에서 확인 불가"
+    return {"selected": selected, "RejectReason": "; ".join(rejects), "Issue": issue, "topic": topic, "score": score, "Risk": risk, "URL": url, "Headline": headline, "Date": clean(date_val), "Country": clean(row.get("Country", row.get("country", ""))), "Agency": clean(row.get("Agency", row.get("agency", ""))), "Source": clean(row.get("Source", row.get("source", ""))), "Summary": analysis.get("Summary", ""), "AI Analysis": analysis.get("AI Analysis", ""), "Action Plan": analysis.get("Action Plan", action), "Owner": owner, "KeywordMatches": "; ".join(keyword_hits[:12]), "tariff_rate_hint": extract_tariff_rate(text), "effective_date_hint": effective_hint or "본문에서 확인 불가", "hs_hint": hs_value or "본문에서 확인 불가", "article_extract_status": analysis.get("article_extract_status", ""), "Samsung Impact": ai_impact, "Top3 Eligible": top3, "PriorityEligible": top3, "DecisionStatus": decision_status, "Policy Stage": policy_stage, "BillNo": bill_no, "DocumentIdentity": document_identity, "EventKey": source_event_key, "Body Verified": analysis.get("Body Verified", "N"), "Change Type": analysis.get("Change Type", "기타"), "Evidence": analysis.get("Evidence", ""), "Missing Facts": analysis.get("Missing Facts", ""), "RegulationMappingType": mapping_type, "MappingStatus": mapping_status, "RequiredMappingKeys": clean(row.get("RequiredMappingKeys", "")), "EntityDirectFlag": "Y" if mapping_type == "ENTITY_DIRECT" else "N", "SamsungRelevanceScore": samsung_relevance, "CustomsTradePolicyScore": policy_score, "DirectImpactScore": direct_score, "WeightedScore": weighted_score}
 
 def read_input():
-    if not INPUT_FILE.exists(): raise FileNotFoundError(f"input not found: {INPUT_FILE}")
-    df = normalize_columns(pd.read_excel(INPUT_FILE))
-    log(f"LOAD {INPUT_FILE}: {len(df)} rows")
+    input_path = INPUT_FILE if INPUT_FILE.exists() else FALLBACK_INPUT_FILE
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"regulation input not found: {INPUT_FILE} / {FALLBACK_INPUT_FILE}"
+        )
+    df = normalize_columns(pd.read_excel(input_path))
+    log(f"LOAD {input_path}: {len(df)} rows")
     # normalize common caps for scoring
     if "Headline" not in df.columns and "title" in df.columns: df["Headline"] = df["title"]
     if "URL" not in df.columns and "url" in df.columns: df["URL"] = df["url"]
@@ -779,12 +1022,28 @@ def read_input():
     if "Source" not in df.columns and "source" in df.columns: df["Source"] = df["source"]
     return df
 
+def strict_24h(df):
+    if df.empty:
+        return df.copy(), df.copy()
+    out = df.copy()
+    keep, published, start, end = previous_kst_day_mask(out.get("Date"))
+    fresh = out.loc[keep].copy()
+    stale = out.loc[~keep].copy()
+    log(
+        f"KST PRIOR-DAY REGULATION GUARD: {len(out)} -> {len(fresh)} / "
+        f"removed={len(stale)} / window={start} <= Date < {end}"
+    )
+    return fresh, stale
+
 def build(df):
     rows=[]
     for _, row in df.iterrows():
         s=score_row(row)
         rows.append(s)
     audit=pd.DataFrame(rows)
+    if audit.empty:
+        audit = pd.DataFrame(columns=["selected", "score", "Date"])
+        return audit.copy(), audit.copy(), audit
     selected_all=audit[audit["selected"]].copy().sort_values(["score","Date"], ascending=[False, False]).reset_index(drop=True)
     selected=selected_all.head(TOP_N_MAX).copy().reset_index(drop=True)
     over_top=selected_all.iloc[TOP_N_MAX:].copy()
@@ -797,14 +1056,45 @@ def build(df):
 def to_output(df, content_type="Regulation"):
     rows=[]
     for i,r in df.reset_index(drop=True).iterrows():
-        impact = "Watch"
+        impact = clean(r.get("Samsung Impact", "Watch")) or "Watch"
+        headline = clean(r.get("Headline"))
+        agency = clean(r.get("Agency"))
+        country = clean(r.get("Country", ""))
+        if "관세청" in headline:
+            agency = "대한민국 관세청"
+            country = "대한민국"
+        strategic_priority = clean(r.get("topic")) == "EXPORT_CONTROL" or any(
+            term in headline.lower() for term in ["전략물자", "수출통제", "export control", "entity list"]
+        )
         rows.append({
             "No": i+1, "Content Type": content_type, "Mail Group": "Regulation" if content_type=="Regulation" else "News - 주요/참고",
-            "Samsung Impact": impact, "Affected Subsidiary": "관련 법인 검토", "Impact Reason": "official_trade_regulation_watch",
-            "Date": r["Date"], "Headline": r["Headline"], "Summary": r["Summary"], "AI Analysis": r["AI Analysis"], "Action Plan": r["Action Plan"],
-            "Country": "", "Agency": r["Agency"], "Risk": r["Risk"], "Importance Score": int(r["score"]), "Priority Group": "CORE" if int(r["score"])>=85 else "USABLE",
+            "Samsung Impact": impact,
+            "Affected Subsidiary": "HQ 수출통제·관세팀 / 관련 사업부" if strategic_priority else "관련 법인 검토",
+            "Impact Reason": "critical_export_control_regulation_pending_verification" if strategic_priority else "official_trade_regulation_watch",
+            "Date": r["Date"], "Headline": headline, "Summary": r["Summary"], "AI Analysis": r["AI Analysis"], "Action Plan": r["Action Plan"],
+            "Country": country, "Agency": agency,
+            "Risk": "상" if strategic_priority else r["Risk"],
+            "Importance Score": 100 if strategic_priority else int(r["score"]),
+            "Priority Group": "CORE" if strategic_priority or int(r["score"])>=85 else "USABLE",
             "Issue": r["Issue"], "Cluster": r["Headline"], "URL": r["URL"], "Source": r["Source"], "Source File": "3-1.regulation_article_summary.xlsx",
-            "RejectReason": r.get("RejectReason", ""), "KeywordMatches": r.get("KeywordMatches", ""), "effective_date_hint": r.get("effective_date_hint", "본문에서 확인 불가"), "hs_hint": r.get("hs_hint", "본문에서 확인 불가"), "tariff_rate_hint": r.get("tariff_rate_hint", "본문에서 확인 불가")
+            "Top3 Eligible": r.get("Top3 Eligible", "N"), "Body Verified": r.get("Body Verified", "N"), "Change Type": r.get("Change Type", "기타"), "Evidence": r.get("Evidence", ""), "Missing Facts": r.get("Missing Facts", ""),
+            "PriorityEligible": r.get("PriorityEligible", r.get("Top3 Eligible", "N")), "DecisionStatus": r.get("DecisionStatus", "Monitoring"), "Policy Stage": r.get("Policy Stage", ""),
+            "BillNo": r.get("BillNo", ""), "DocumentIdentity": r.get("DocumentIdentity", ""), "EventKey": r.get("EventKey", ""),
+            "OriginalDateStatus": r.get("OriginalDateStatus", ""), "DateSource": r.get("date_source", r.get("DateSource", "")),
+            "CustomsOperationalWatchFlag": r.get("CustomsOperationalWatchFlag", "N"),
+            "RegulationMappingType": r.get("RegulationMappingType", ""), "MappingStatus": r.get("MappingStatus", ""), "RequiredMappingKeys": r.get("RequiredMappingKeys", ""), "EntityDirectFlag": r.get("EntityDirectFlag", "N"),
+            "SamsungRelevanceScore": r.get("SamsungRelevanceScore", 0), "CustomsTradePolicyScore": r.get("CustomsTradePolicyScore", 0), "DirectImpactScore": r.get("DirectImpactScore", 0), "WeightedScore": r.get("WeightedScore", 0),
+            "RejectReason": r.get("RejectReason", ""), "KeywordMatches": r.get("KeywordMatches", ""), "effective_date_hint": r.get("effective_date_hint", "본문에서 확인 불가"), "hs_hint": r.get("hs_hint", "본문에서 확인 불가"), "tariff_rate_hint": r.get("tariff_rate_hint", "본문에서 확인 불가"),
+            "EvidenceStatus": "VERIFIED" if clean(r.get("Body Verified")) == "Y" and clean(r.get("Evidence")) else ("SUPPORTED" if clean(r.get("Body Verified")) == "Y" else "PENDING"),
+            "WhatChanged": clean(r.get("Summary")),
+            "PolicyStageDisplay": clean(r.get("Policy Stage")) or clean(r.get("Change Type")),
+            "EffectiveDate": clean(r.get("effective_date_hint")) or "확인 필요",
+            "AffectedProduct": "확인 필요",
+            "AffectedHS": clean(r.get("hs_hint")) or "확인 필요",
+            "SamsungImpactPath": clean(r.get("AI Analysis")),
+            "RecommendedAction": clean(r.get("Action Plan")),
+            "VerificationNeeded": clean(r.get("Missing Facts")) or "추가 확인 없음",
+            "OfficialURL": clean(r.get("URL")) if clean(r.get("Body Verified")) == "Y" else "",
         })
     return pd.DataFrame(rows, columns=OUTPUT_COLS)
 
@@ -814,10 +1104,143 @@ def normalize_cum_cols(df):
         if c not in df.columns: df[c]=""
     return df[OUTPUT_COLS]
 
+def _legacy_compound_title(title):
+    markers = re.findall(
+        r'(?:법률|대통령령|총리령)제\s*\d+호|'
+        r'[가-힣]{2,30}(?:부령|고시|공고|훈령|예규)제?\s*\d{4}(?:[-–]\d+)?호',
+        clean(title),
+    )
+    return len(markers) >= 2
+
+def _clean_legacy_cumulative(df):
+    """Migrate legacy STEP4 rows to the current evidence/mapping contract."""
+    old = normalize_cum_cols(df)
+    if old.empty:
+        return old
+    keep_rows = []
+    for _, row in old.iterrows():
+        r = row.copy()
+        headline = clean(r.get("Headline"))
+        url = clean(r.get("URL"))
+        low = headline.lower()
+        if not headline or not url:
+            continue
+        if low in {"feedback", "directorates", "helpdesk", "website policy"}:
+            continue
+        if re.fullmatch(r"법률\s*제?\s*\d+호", headline):
+            continue
+        if _legacy_compound_title(headline):
+            continue
+        if contains_terms(low, ["와인제품", "포도주", "denominação de origem", "denomination of origin", "geographical indication"]):
+            continue
+        if contains_terms(low, REGULATION_HARD_NOISE_TERMS):
+            continue
+        if contains_terms(low, [
+            "전체 관세청 유관기관", "시스템 작업 안내", "오프라인 작업 안내",
+            "시범운영 시행 안내", "서비스 일시중단", "점검 작업 안내",
+            "공휴일법", "hari kelepasan", "holiday act", "국세기본법",
+            "철도안전법", "음주운전", "범인도피", "상속재산가액",
+            "방송통신기자재등 시험기관", "자원순환에 관한 법률", "수출검역요령",
+            "마약", "밀수", "특별검사팀", "현장 점검",
+            "thúc đẩy hợp tác hải quan", "đối thoại hải quan", "phiên đối thoại",
+            "sơ bộ tình hình xuất nhập khẩu", "bắt giữ", "giả nhãn hiệu", "lịch bảo trì hệ thống",
+        ]):
+            continue
+
+        text = row_text(r)
+        topic = detect_topic(text)
+        strict = has_strict_trade_reg_signal(text, r)
+        if topic == "TRADE_GENERAL" and not strict:
+            continue
+
+        body_ok = clean(r.get("Body Verified")).upper() == "Y"
+        samsung_named = contains_terms(text, [
+            "삼성전자", "samsung electronics", "삼성디스플레이", "samsung display"
+        ])
+        product_specific = topic in {"AD_CVD", "HS_CLASSIFICATION", "EXPORT_CONTROL", "CBAM_CARBON"}
+        prior_mapping_status = clean(r.get("MappingStatus"))
+        item_mapped = body_ok and prior_mapping_status in {"MAPPED", "ITEM_1TO1_MAPPED"}
+
+        if samsung_named and body_ok:
+            mapping_type, mapping_status, impact = "ENTITY_DIRECT", "ENTITY_CONFIRMED", "Direct"
+            required = "SamsungEntity; Transaction"
+        elif product_specific:
+            mapping_type = "PRODUCT_1TO1"
+            mapping_status = "MAPPED" if item_mapped else ("MAPPING_REQUIRED" if body_ok else "VERIFICATION_PENDING")
+            impact = "Direct" if item_mapped else "Watch"
+            required = "Product; HSCode; OriginCountry; Supplier; SamsungEntity; ImportHistory"
+        else:
+            mapping_type = "POLICY_GENERAL"
+            mapping_status = "VERIFIED_GENERAL" if body_ok else "VERIFICATION_PENDING"
+            impact = "Watch"
+            required = "Country; SamsungEntity"
+
+        r["RegulationMappingType"] = mapping_type
+        r["MappingStatus"] = mapping_status
+        r["RequiredMappingKeys"] = required
+        r["EntityDirectFlag"] = "Y" if mapping_type == "ENTITY_DIRECT" else "N"
+        r["Samsung Impact"] = impact
+        policy_score_hint = max(
+            pd.to_numeric(pd.Series([r.get("CustomsTradePolicyScore", 0), r.get("Importance Score", 0)]), errors="coerce").fillna(0)
+        )
+        high_materiality = body_ok and policy_score_hint >= 85
+        r["Top3 Eligible"] = "Y" if (impact == "Direct" and body_ok) or high_materiality else "N"
+        r["PriorityEligible"] = r["Top3 Eligible"]
+        r["DecisionStatus"] = (
+            "Verification Pending" if not body_ok else
+            "Action Required" if impact == "Direct" else
+            "Urgent Verification" if high_materiality else "Monitoring"
+        )
+        r["SamsungRelevanceScore"] = 100 if impact == "Direct" else 50
+        r["DirectImpactScore"] = 100 if impact == "Direct" else 35
+        score_value = pd.to_numeric(
+            pd.Series([r.get("CustomsTradePolicyScore", 0), r.get("Importance Score", 0)]),
+            errors="coerce",
+        ).fillna(0)
+        policy_score = max(0, min(100, int(score_value.max())))
+        importance_raw = pd.to_numeric(r.get("Importance Score", 0), errors="coerce")
+        r["Importance Score"] = max(0, min(100, int(importance_raw if pd.notna(importance_raw) else 0)))
+        r["CustomsTradePolicyScore"] = policy_score
+        r["WeightedScore"] = round(policy_score * 0.4 + int(r["DirectImpactScore"]) * 0.4 + int(r["SamsungRelevanceScore"]) * 0.2)
+        keep_rows.append(r)
+
+    cleaned = pd.DataFrame(keep_rows, columns=OUTPUT_COLS)
+    if cleaned.empty:
+        return normalize_cum_cols(cleaned)
+    cleaned["_date_key"] = pd.to_datetime(
+        cleaned["Date"], errors="coerce", format="mixed"
+    ).dt.strftime("%Y-%m-%d").fillna("")
+    cleaned["_title_key"] = cleaned["Headline"].fillna("").astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+    identity = cleaned.get("DocumentIdentity", pd.Series("", index=cleaned.index)).fillna("").astype(str).str.lower().str.strip()
+    event_key = cleaned.get("EventKey", pd.Series("", index=cleaned.index)).fillna("").astype(str).str.lower().str.strip()
+    url_key = cleaned["URL"].fillna("").astype(str).str.lower().str.strip()
+    cleaned["_document_key"] = identity.where(identity.ne(""), event_key.where(event_key.ne(""), url_key))
+    fallback_key = cleaned["_title_key"] + "|" + cleaned["_date_key"]
+    cleaned["_document_key"] = cleaned["_document_key"].where(cleaned["_document_key"].ne(""), fallback_key)
+    cleaned = cleaned.drop_duplicates(["_document_key"], keep="last")
+    return normalize_cum_cols(cleaned.drop(columns=["_title_key", "_date_key", "_document_key"], errors="ignore"))
+
 def merge_cumulative(daily):
+    global CUMULATIVE_REMOVED_DF
     if OUT_CUMULATIVE.exists():
         try:
-            old=normalize_cum_cols(pd.read_excel(OUT_CUMULATIVE)); log(f"cumulative existing load: {len(old)} rows")
+            old_raw = pd.read_excel(OUT_CUMULATIVE)
+            old = _clean_legacy_cumulative(old_raw)
+            log(f"cumulative existing load: {len(old_raw)} -> cleaned={len(old)} rows")
+            raw_norm = normalize_cum_cols(old_raw)
+            kept_keys = set(
+                old["URL"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + old["Headline"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + old["Date"].fillna("").astype(str).str[:10]
+            )
+            raw_keys = (
+                raw_norm["URL"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + raw_norm["Headline"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + raw_norm["Date"].fillna("").astype(str).str[:10]
+            )
+            CUMULATIVE_REMOVED_DF = raw_norm.loc[~raw_keys.isin(kept_keys)].copy()
+            if not CUMULATIVE_REMOVED_DF.empty:
+                CUMULATIVE_REMOVED_DF["RejectReason"] = "LEGACY_CUMULATIVE_REVALIDATION"
         except Exception: old=pd.DataFrame(columns=OUTPUT_COLS)
     else:
         old=pd.DataFrame(columns=OUTPUT_COLS); log("cumulative file missing -> new create")
@@ -881,13 +1304,41 @@ def _is_bad_cached_analysis(item: dict, headline: str) -> bool:
 
 def _extract_terms_for_analysis(text: str) -> dict:
     t = clean(text)
-    hs = sorted(set(re.findall(r"\b\d{4}(?:\.\d{2})?(?:\.\d{2})?\b", t)))[:6]
+    # 4자리 숫자만으로는 HS로 인정하지 않는다.
+    # 관보 전화번호, 연도, 고시번호를 HS로 오인하는 문제를 방지한다.
+    hs = []
+    for m in re.finditer(
+        r"(?i)(?:HS(?:\s*CODE)?|품목분류|세번)"
+        r"\s*[:：-]?\s*(\d{4}(?:[.\s]?\d{2}){0,2})",
+        t,
+    ):
+        code = re.sub(r"\s+", "", m.group(1))
+        if code not in hs:
+            hs.append(code)
+    hs = hs[:6]
     rates = sorted(set(re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%", t)))[:6]
     countries = []
     for c in ["미국", "중국", "일본", "EU", "유럽", "베트남", "인도", "모로코", "한국", "영국", "멕시코", "캐나다", "United States", "China", "Japan", "Vietnam", "India", "Morocco", "Korea", "EU"]:
         if c.lower() in t.lower():
             countries.append(c)
     return {"hs": "; ".join(hs) or "본문에서 확인 불가", "rates": "; ".join(rates) or "본문에서 확인 불가", "countries": "; ".join(dict.fromkeys(countries)) or "본문에서 확인 불가"}
+
+
+def _is_navigation_or_gazette_shell(text: str) -> bool:
+    """관보 검색·메뉴 화면을 법규 본문으로 인정하지 않는다."""
+    t = clean(text)
+    markers = [
+        "관보보기", "기본검색", "고급검색", "인기관보",
+        "정정관보", "관보소개", "이용문의",
+    ]
+    legal_markers = [
+        "별표", "개정이유", "주요내용", "부칙",
+        "시행한다", "변경 전", "변경 후",
+    ]
+    return (
+        sum(m in t for m in markers) >= 3
+        and not any(m in t for m in legal_markers)
+    )
 
 def _fallback_gti_analysis_from_body(*, body: str, headline: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
     summary = _simple_body_summary(body, headline)
@@ -995,6 +1446,10 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
     if not body:
         body, status = fetch_article_body_for_ai(url)
 
+    if _is_navigation_or_gazette_shell(body):
+        body = ""
+        status = f"INVALID_GAZETTE_SHELL:{status}"
+
     cache = _ensure_gemini_cache()
     key = _analysis_cache_key(url, headline)
     cached = cache.get(key)
@@ -1002,21 +1457,37 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
         return cached
 
     prompt = f"""
-당신은 삼성전자 본사 관세/통상 리스크 분석가입니다.
-아래 원문을 읽고 GTI Radar 임원보고용으로 분석하십시오.
+당신은 삼성전자 본사 관세·통상 및 관세컴플라이언스 책임자입니다.
+아래 공식 법규/공고의 원문만 근거로 GTI Radar 의사결정 보고서를 작성하십시오.
+
+분석 순서(반드시 준수):
+1) 사실관계: 문서명, 발표기관·국가, 신규/개정/시행/조사 단계, 발표일·시행일, 대상 품목·HS, 세율·쿼터, 신고·증빙 요건을 원문 근거로 정리.
+2) 삼성전자 관세업무 직접영향: 수입·수출통관, HS, 과세가격, 원산지/FTA, AD/CVD, 관세비용, 수출통제 중 실제로 바뀌는 업무와 영향 법인·제품·거래 흐름을 설명.
+3) 대응: 즉시(오늘~3영업일), 1개월 내, 상시 모니터링 및 Owner를 분리.
+
+Direct 판정 조건:
+- 삼성전자 법인이 소재한 국가의 일반 통관·신고·납부·증빙·세관조사·심판청구·이의신청·행정절차 변경은 해당 국가 법인에 Direct.
+- 특정품목의 관세율·HS·AD/CVD·원산지·수출통제 조치는 삼성 제품/원재료 + HS + 영향 법인 + 수출입 경로가 1:1로 확인될 때만 Direct.
+- 특정품목 1:1 매핑이 불완전하면 Direct 금지하고 Missing Facts에 누락 키를 기록.
+- 국가명, 산업명, 삼성/반도체 단어만으로 Direct 금지. 불명확하면 Indirect 또는 Watch.
 
 절대 금지:
-- 제목 반복 금지
-- "관련 뉴스입니다", "공식 규제/공지 후보입니다" 같은 템플릿 문장 금지
-- 본문에 없는 세율/HS/국가/시행일을 지어내지 말 것
-- 본문을 읽을 수 없으면 Summary에 "본문 확인 불가"라고 명시
+- 제목 반복, 일반론, 모든 법인에 동일한 문구 사용 금지
+- 원문에 없는 세율·HS·국가·시행일·대상제품을 추정하거나 지어내지 말 것
+- 본문을 읽을 수 없으면 body_verified=false, Samsung Impact=Watch, Top3 Eligible=false
 
 출력은 JSON만:
 {{
-  "Summary": "원문 기준 게시물 요약 2~3줄",
-  "AI Analysis": "삼성전자 관세업무 영향. 수입통관/수출통관/FTA·원산지/HS/관세비용/수출통제 중 해당 항목을 구체적으로 설명",
-  "Action Plan": "즉시조치/1주 내/1개월 내/Owner 형식의 구체적 대응방안",
-  "ExecutiveMessage": "임원용 한 문단 핵심 메시지"
+  "Summary": "[사실관계] 원문 근거 3~5문장. 신규/개정 구분과 적용일 포함",
+  "AI Analysis": "[삼성전자 관세업무 직접영향] 영향 경로·법인·제품·업무·비용/리스크를 근거와 함께 4~7문장",
+  "Action Plan": "[즉시] ... | [1개월 내] ... | [상시] ... | [Owner] ...",
+  "ExecutiveMessage": "무엇이 바뀌며 삼성전자 관세업무가 무엇을 결정해야 하는지 2문장",
+  "Samsung Impact": "Direct|Indirect|Watch",
+  "Top3 Eligible": false,
+  "body_verified": true,
+  "change_type": "신규|개정|시행|조사개시|판정|기타",
+  "evidence": ["원문 근거1", "원문 근거2"],
+  "missing_facts": ["원문에서 확인되지 않은 필수정보"]
 }}
 
 기본 정보:
@@ -1040,12 +1511,23 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
         executive = clean(result.get("ExecutiveMessage", ""))
 
         if not _looks_like_title_only(summary, headline) and not _is_generic_or_bad_analysis(ai) and not _is_generic_or_bad_analysis(action_plan):
+            ai_impact = clean(result.get("Samsung Impact", "Watch"))
+            if ai_impact not in {"Direct", "Indirect", "Watch"}:
+                ai_impact = "Watch"
+            body_verified = as_bool(result.get("body_verified")) and bool(body) and "TOO_SHORT" not in str(status)
+            top3_eligible = as_bool(result.get("Top3 Eligible")) and body_verified and ai_impact == "Direct"
             final = {
                 "Summary": summary[:900],
                 "AI Analysis": ai[:1200],
                 "Action Plan": action_plan[:1200],
                 "ExecutiveMessage": (executive or summary)[:700],
                 "article_extract_status": f"GEMINI_OK|{status}",
+                "Samsung Impact": ai_impact,
+                "Top3 Eligible": "Y" if top3_eligible else "N",
+                "Body Verified": "Y" if body_verified else "N",
+                "Change Type": clean(result.get("change_type", "기타")),
+                "Evidence": " | ".join(clean(x) for x in result.get("evidence", []) if clean(x))[:1200],
+                "Missing Facts": " | ".join(clean(x) for x in result.get("missing_facts", []) if clean(x))[:900],
             }
             cache[key] = final
             _save_gemini_cache()
@@ -1060,6 +1542,14 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
         default_action=default_action,
         content_type=content_type,
     )
+    final.update({
+        "Samsung Impact": "Watch",
+        "Top3 Eligible": "N",
+        "Body Verified": "Y" if body and "TOO_SHORT" not in str(status) else "N",
+        "Change Type": "기타",
+        "Evidence": "",
+        "Missing Facts": "Gemini 분석 실패 또는 원문 근거 부족",
+    })
     final["article_extract_status"] = f"{final.get('article_extract_status')}|{status}|GEMINI={'Y' if GEMINI_API_KEY else 'NO_KEY'}"
     # Cache fallback only when Gemini is unavailable, but mark it so later runs with API key can regenerate.
     cache[key] = final
@@ -1313,1543 +1803,56 @@ def _gti_step4_extractor_log_once():
 # End of GTI STEP4 Article Body Extraction Patch v7.0
 # ======================================================================
 
-
-# ======================================================================
-# GTI STEP4 Gemini Call / Output Patch v8.0
-# ----------------------------------------------------------------------
-# v7 보완
-# 1) Gemini 호출 실패 사유를 article_extract_status에 남김
-# 2) responseMimeType 미지원/모델 오류에도 JSON 파싱 재시도
-# 3) 모델 fallback: 환경변수 모델 → gemini-2.0-flash → gemini-1.5-flash
-# 4) Gemini 결과가 정상일 때만 GEMINI_OK 표시, 아니면 FALLBACK_RULE_BODY + 오류 표시
-# 5) Regulation 결과에도 article_extract_status 출력
-# ======================================================================
-
-GEMINI_MODEL_CANDIDATES = []
-for _m in [
-    os.getenv("GTI_GEMINI_MODEL", "").strip(),
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-]:
-    if _m and _m not in GEMINI_MODEL_CANDIDATES:
-        GEMINI_MODEL_CANDIDATES.append(_m)
-
-_LAST_GEMINI_ERROR = ""
-
-def _extract_json_object(text: str) -> dict:
-    txt = clean(text)
-    if not txt:
-        return {}
-    txt = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
-    txt = re.sub(r"\s*```$", "", txt.strip())
-    try:
-        return json.loads(txt)
-    except Exception:
-        pass
-    start = txt.find("{")
-    end = txt.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(txt[start:end+1])
-        except Exception:
-            return {}
-    return {}
-
-def call_gemini_json(prompt: str) -> dict:
-    """v8 override: robust Gemini call with error details and model fallback."""
-    global _LAST_GEMINI_ERROR
-    _LAST_GEMINI_ERROR = ""
-
-    if not USE_GEMINI:
-        _LAST_GEMINI_ERROR = "DISABLED"
-        return {"_error": _LAST_GEMINI_ERROR}
-    if not GEMINI_API_KEY:
-        _LAST_GEMINI_ERROR = "NO_API_KEY"
-        return {"_error": _LAST_GEMINI_ERROR}
-
-    last_error = ""
-    for model in GEMINI_MODEL_CANDIDATES:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        payloads = [
-            {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "topP": 0.8,
-                    "maxOutputTokens": 1600,
-                    "responseMimeType": "application/json",
-                },
-            },
-            {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "topP": 0.8,
-                    "maxOutputTokens": 1600,
-                },
-            },
-        ]
-        for idx, payload in enumerate(payloads, start=1):
-            try:
-                data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    raw = resp.read().decode("utf-8", "ignore")
-                out = json.loads(raw)
-
-                if "error" in out:
-                    msg = out.get("error", {}).get("message", str(out.get("error")))
-                    last_error = f"{model}/payload{idx}:API_ERROR:{msg[:250]}"
-                    continue
-
-                cand = (out.get("candidates") or [{}])[0]
-                finish = cand.get("finishReason", "")
-                parts = cand.get("content", {}).get("parts", [])
-                text = "\n".join(clean(p.get("text", "")) for p in parts if isinstance(p, dict))
-                parsed = _extract_json_object(text)
-                if parsed:
-                    parsed["_gemini_model"] = model
-                    parsed["_gemini_finish"] = finish
-                    _LAST_GEMINI_ERROR = ""
-                    return parsed
-                last_error = f"{model}/payload{idx}:NO_JSON finish={finish} text={text[:180]}"
-            except Exception as exc:
-                last_error = f"{model}/payload{idx}:{type(exc).__name__}:{str(exc)[:250]}"
-
-    _LAST_GEMINI_ERROR = last_error or "UNKNOWN_GEMINI_ERROR"
-    return {"_error": _LAST_GEMINI_ERROR}
-
-def _is_useful_gemini_result(summary: str, ai: str, action_plan: str, headline: str) -> bool:
-    if _looks_like_title_only(summary, headline):
-        return False
-    if not summary or len(summary) < 30:
-        return False
-    if not ai or len(ai) < 80:
-        return False
-    if not action_plan or len(action_plan) < 50:
-        return False
-    bad_ai = [
-        "관련 뉴스입니다",
-        "공식 규제/공지 후보입니다",
-        "본문 확인 불가로 정밀 영향 분석이 제한됩니다",
-        "원문 본문 기반 세부 영향은 Summary 내용을 기준으로",
-    ]
-    if any(x in ai for x in bad_ai):
-        return False
-    return True
-
-def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
-    """v8 override: Gemini first, useful fallback second, with diagnostic status."""
-    body, body_status = _fallback_source_body(row, headline)
-    if not body:
-        body, body_status = fetch_article_body_for_ai(url)
-
-    cache = _ensure_gemini_cache()
-    key = _analysis_cache_key(url, headline)
-    cached = cache.get(key)
-    if cached and not _is_bad_cached_analysis(cached, headline):
-        return cached
-
-    body_for_prompt = body if body else f"본문 확보 실패. Headline: {headline}. URL: {url}"
-
-    prompt = f"""
-당신은 삼성전자 본사 관세/통상 리스크 분석가입니다.
-아래 원문을 읽고 GTI Radar 임원보고용으로 분석하십시오.
-
-절대 금지:
-- 제목 반복 금지
-- "관련 뉴스입니다", "공식 규제/공지 후보입니다" 같은 템플릿 문장 금지
-- 본문에 없는 세율/HS/국가/시행일을 지어내지 말 것
-- 본문을 읽을 수 없으면 Summary에 "본문 확인 불가"라고 명시
-
-반드시 아래 JSON 형식만 출력하십시오:
-{{
-  "Summary": "원문 기준 게시물 요약 2~3줄",
-  "AI Analysis": "삼성전자 관세업무 영향. 수입통관/수출통관/FTA·원산지/HS/관세비용/수출통제 중 해당 항목을 구체적으로 설명",
-  "Action Plan": "즉시조치/1주 내/1개월 내/Owner 형식의 구체적 대응방안",
-  "ExecutiveMessage": "임원용 한 문단 핵심 메시지"
-}}
-
-기본 정보:
-- Content Type: {content_type}
-- Issue: {issue}
-- Samsung Impact: {impact}
-- Affected Products: {products_text}
-- URL: {url}
-- Headline: {headline}
-- Default Action Hint: {default_action}
-
-원문:
-{body_for_prompt[:ARTICLE_MAX_CHARS]}
-""".strip()
-
-    result = call_gemini_json(prompt)
-    if result and not result.get("_error"):
-        summary = clean(result.get("Summary", ""))
-        ai = clean(result.get("AI Analysis", ""))
-        action_plan = clean(result.get("Action Plan", ""))
-        executive = clean(result.get("ExecutiveMessage", ""))
-
-        if _is_useful_gemini_result(summary, ai, action_plan, headline):
-            final = {
-                "Summary": summary[:900],
-                "AI Analysis": ai[:1400],
-                "Action Plan": action_plan[:1400],
-                "ExecutiveMessage": (executive or summary)[:800],
-                "article_extract_status": f"GEMINI_OK|model={result.get('_gemini_model','')}|body={body_status}",
-            }
-            cache[key] = final
-            _save_gemini_cache()
-            return final
-
-    final = _fallback_gti_analysis_from_body(
-        body=body,
-        headline=headline,
-        issue=issue,
-        impact=impact,
-        products_text=products_text,
-        default_action=default_action,
-        content_type=content_type,
-    )
-    gem_err = clean(result.get("_error", "")) if isinstance(result, dict) else clean(_LAST_GEMINI_ERROR)
-    final["article_extract_status"] = f"FALLBACK_RULE_BODY|body={body_status}|gemini_error={gem_err[:220]}|api_key={'Y' if GEMINI_API_KEY else 'N'}"
-    cache[key] = final
-    _save_gemini_cache()
-    return final
-
-def _ensure_output_cols_article_status():
-    try:
-        for col in ["article_extract_status", "ExecutiveMessage"]:
-            if "OUTPUT_COLS" in globals() and col not in OUTPUT_COLS:
-                OUTPUT_COLS.append(col)
-    except Exception:
-        pass
-
-_ensure_output_cols_article_status()
-
-# ======================================================================
-# End of GTI STEP4 Gemini Call / Output Patch v8.0
-# ======================================================================
-
-
-# ======================================================================
-# GTI STEP4 Article Cleanup Patch v9.0
-# ----------------------------------------------------------------------
-# 보완사항
-# 1) 언론사 UI 문구 제거: 글자크기/이전기사/다음기사/공유/스크롤 등
-# 2) Google 뉴스/제목 수준 요약 차단
-# 3) routine 환율공지/농수산물/일반산업 기사의 과대 분석 방지
-# 4) Gemini 입력 전 본문 정제
-# ======================================================================
-
-ARTICLE_UI_NOISE_PATTERNS = [
-    "이전 기사보기", "다음 기사보기", "기사의 본문 내용은 이 글자크기로 변경됩니다",
-    "본문 글씨 키우기", "본문 글씨 줄이기", "스크롤 이동 상태바", "바로가기 복사하기",
-    "공유 이메일에 공유하기", "카카오톡에 공유하기", "페이스북에 공유하기", "트위터에 공유하기",
-    "링크 복사하기", "닫기", "번역 ENG JPN CHN", "편의기능", "AI기능", "추천질문",
-    "관련종목", "AI해설", "에디터 픽", "추천기사", "본문영역", "기사원문",
-    "댓글 0", "인쇄", "즐겨찾기", "가 가",
-]
-
-LOW_VALUE_ARTICLE_TERMS = [
-    "rate of exchange", "exchange rate", "과세환율", "wheat", "밀 수출", "새우", "라이스페이퍼",
-    "염소산업", "혈통관리", "스포츠", "맛집", "여행", "주가", "증시", "브랜드",
-]
-
-def clean_article_text_for_gti(text: str) -> str:
-    t = clean(text)
-    if not t:
-        return ""
-    t = re.sub(r"\s+", " ", t).strip()
-    for p in ARTICLE_UI_NOISE_PATTERNS:
-        t = t.replace(p, " ")
-    # Remove short UI lines/fragments
-    t = re.sub(r"(?<![가-힣])가\s+가(?![가-힣])", " ", t)
-    t = re.sub(r"(공유|닫기|인쇄|즐겨찾기|댓글|추천기사|AI해설|관련종목)\s*", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def article_text_quality(text: str, headline: str) -> str:
-    t = clean_article_text_for_gti(text)
-    h = clean(headline)
-    if not t:
-        return "EMPTY"
-    if t in {"Google 뉴스", "Google News"}:
-        return "GOOGLE_NEWS_ONLY"
-    if h and (t == h or t.replace(" ", "") == h.replace(" ", "")):
-        return "TITLE_ONLY"
-    if len(t) < 120:
-        return "TOO_SHORT"
-    if any(p in text for p in ARTICLE_UI_NOISE_PATTERNS) and len(t) < 250:
-        return "UI_NOISE_ONLY"
-    return "OK"
-
-def _fallback_source_body(row: pd.Series, headline: str) -> tuple[str, str]:
-    """v9 override: use input body only when it is not UI garbage."""
-    for col in [
-        "article_body", "regulation_fallback_body", "full_text", "FullText",
-        "content", "Content", "body", "Body", "Summary", "AI Analysis",
-        "ClusterHeadlines", "description", "Description",
-    ]:
-        raw = clean(row.get(col, ""))
-        val = clean_article_text_for_gti(raw)
-        quality = article_text_quality(val, headline)
-        if val and quality == "OK":
-            return val[:ARTICLE_MAX_CHARS], f"INPUT_COLUMN:{col}"
-    return "", "NO_INPUT_BODY"
-
-def _simple_body_summary(body: str, headline: str) -> str:
-    body = clean_article_text_for_gti(body)
-    if not body:
-        return "본문 확인 불가: 원문 URL에서 본문을 가져오지 못했습니다. 제목만으로 요약하지 않았습니다."
-    quality = article_text_quality(body, headline)
-    if quality != "OK":
-        return f"본문 확인 불가: 본문 추출 결과가 {quality} 상태입니다. 제목만으로 요약하지 않았습니다."
-    text = re.sub(r"\s+", " ", body).strip()
-    parts = re.split(r"(?<=[.!?。？！])\s+|(?<=다\.)\s+|(?<=니다\.)\s+", text)
-    parts = [clean_article_text_for_gti(p.strip()) for p in parts if clean_article_text_for_gti(p.strip())]
-    parts = [p for p in parts if not _looks_like_title_only(p, headline) and len(p) >= 25]
-    if not parts:
-        return text[:350]
-    return " ".join(parts[:3])[:700]
-
-def fetch_article_body_for_ai(url: str) -> tuple[str, str]:
-    """v9 override: call existing extractor if available, then clean UI noise."""
-    # Use v7 extractor internals if present.
-    try:
-        raw, ctype, fetch_status = _fetch_url_bytes(safe_url(url))
-        if not raw:
-            return "", fetch_status
-        low_url = safe_url(url).lower()
-        low_ctype = (ctype or "").lower()
-        if low_url.endswith(".pdf") or "application/pdf" in low_ctype:
-            text, status = _extract_pdf_text_from_bytes(raw)
-            return clean_article_text_for_gti(text), status
-        html_text = _decode_bytes(raw, ctype)
-        text, status = _extract_html_best_text(html_text, safe_url(url))
-        cleaned = clean_article_text_for_gti(text)
-        q = article_text_quality(cleaned, "")
-        if cleaned and q == "OK":
-            return cleaned[:ARTICLE_MAX_CHARS], status
-        return cleaned, f"BODY_BAD_QUALITY:{q}:{status}"
-    except Exception:
-        # fallback to old simple fetch if v7 helpers are not available
-        try:
-            u = safe_url(url)
-            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"})
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=ARTICLE_FETCH_TIMEOUT, context=ctx) as resp:
-                raw = resp.read(2_000_000)
-                ctype = resp.headers.get("Content-Type", "")
-            html_text = _decode_bytes(raw, ctype) if "_decode_bytes" in globals() else raw.decode("utf-8", "ignore")
-            text = _strip_html_to_text(html_text)
-            cleaned = clean_article_text_for_gti(text)
-            return cleaned[:ARTICLE_MAX_CHARS], "HTML_STRIPPED_CLEANED"
-        except Exception as exc:
-            return "", f"FETCH_FAILED:{type(exc).__name__}"
-
-def is_low_value_for_ai(headline: str, body: str, issue: str) -> bool:
-    blob = f"{headline} {body} {issue}".lower()
-    return any(k.lower() in blob for k in LOW_VALUE_ARTICLE_TERMS)
-
-def _fallback_gti_analysis_from_body(*, body: str, headline: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
-    """v9 override: avoid over-analysis for routine/low-value items."""
-    body = clean_article_text_for_gti(body)
-    summary = _simple_body_summary(body, headline)
-    issue_l = clean(issue)
-
-    if is_low_value_for_ai(headline, body, issue_l):
-        ai = (
-            "Reference 수준의 참고 정보입니다. 삼성전자 주요 제품·부품·원재료 또는 관세비용에 직접 영향을 주는 "
-            "HS·세율·원산지·수출통제 변경은 확인되지 않았습니다."
-        )
-        action = "즉시조치 불필요. 동일 국가에서 전자부품·전략물자·관세율 관련 후속 공지가 있을 경우 재검토하십시오."
-        return {
-            "Summary": summary[:900],
-            "AI Analysis": ai,
-            "Action Plan": action,
-            "ExecutiveMessage": summary[:300],
-            "article_extract_status": "FALLBACK_REFERENCE_LOW_VALUE",
-        }
-
-    # call previous rule function body by reimplementing concise issue-specific fallback
-    terms_text = f"{headline} {body}"
-    rates = "; ".join(sorted(set(re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%", terms_text)))[:6]) or "본문에서 확인 불가"
-
-    if issue_l in {"AD/CVD", "반덤핑/상계관세", "AD_CVD"}:
-        ai = f"반덤핑/상계관세 이슈입니다. 확인된 세율 정보는 {rates}입니다. 대상 HS·공급국·벤더 기준 수입실적을 매칭하여 추가관세 비용과 원산지/가격자료 방어 리스크를 점검해야 합니다."
-        action = "즉시조치: 대상 HS·공급국·벤더 매핑. 1주 내: 최근 12개월 수입금액 기준 잠재 비용 산출. 1개월 내: 원산지·가격자료 방어파일 구축. Owner: HQ Customs + 구매 + 해당 법인"
-    elif issue_l in {"수출통제", "EXPORT_CONTROL"}:
-        ai = "수출통제 이슈입니다. AI·반도체·전략기술 또는 관련 서비스 접근 제한이 수출통제 범위로 확대될 가능성이 있어 ECCN/전략물자 분류와 최종사용자 스크리닝이 필요합니다."
-        action = "즉시조치: 대상 기술/제품의 수출통제 해당 여부 확인. 1주 내: 거래처·목적지 스크리닝. 1개월 내: Item Master Export Control Flag 반영. Owner: HQ Export Control"
-    elif issue_l in {"CBAM", "CBAM_CARBON"}:
-        ai = "CBAM 이슈입니다. EU향 품목의 내재배출량 자료, 공급사 데이터, 인증서 비용 반영 여부가 관세·준조세 비용 리스크로 연결될 수 있습니다."
-        action = "즉시조치: EU향 대상품목 및 공급사 배출량 자료 확인. 1주 내: CN/HS별 Gap List 작성. 1개월 내: CBAM 비용 산정 프로세스 반영. Owner: HQ Customs + ESG"
-    elif issue_l in {"FTA/원산지", "ORIGIN_FTA"}:
-        ai = "FTA/원산지 이슈입니다. 협정 적용 가능성, CO 발급/수취 요건, BOM 원산지 및 FTA Master 정합성 점검이 필요합니다."
-        action = "즉시조치: 대상 협정·품목·법인 확인. 1주 내: BOM/Vendor 원산지확인서/HS 일치 점검. 1개월 내: FTA Master 업데이트. Owner: HQ Customs/FTA"
-    else:
-        ai = f"{issue_l} 이슈입니다. 삼성전자 관세업무 관점에서는 대상 국가·품목·HS·세율·시행일 기준으로 수입통관, 수출통관, FTA/원산지, 관세비용 영향 여부를 확인해야 합니다."
-        action = f"즉시조치: 원문 기준 대상 국가·품목·시행일 확인. 1주 내: 관련 법인 수입/수출 실적 매칭. Owner: {default_action}"
-
-    return {
-        "Summary": summary[:900],
-        "AI Analysis": ai[:1200],
-        "Action Plan": action[:1200],
-        "ExecutiveMessage": (summary[:220] + " " + ai[:240])[:700],
-        "article_extract_status": "FALLBACK_RULE_BODY_CLEANED",
-    }
-
-def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
-    """v9 override: clean body before Gemini and prevent garbage summaries."""
-    body, body_status = _fallback_source_body(row, headline)
-    if not body:
-        body, body_status = fetch_article_body_for_ai(url)
-    body = clean_article_text_for_gti(body)
-    q = article_text_quality(body, headline)
-
-    cache = _ensure_gemini_cache()
-    key = _analysis_cache_key(url, headline)
-    cached = cache.get(key)
-    if cached and not _is_bad_cached_analysis(cached, headline):
-        # Do not reuse cached output with UI garbage.
-        if "글자크기" not in clean(cached.get("Summary", "")) and "이전 기사보기" not in clean(cached.get("Summary", "")):
-            return cached
-
-    body_for_prompt = body if body and q == "OK" else f"본문 추출 품질 불량({q}). Headline: {headline}. URL: {url}"
-
-    prompt = f"""
-당신은 삼성전자 본사 관세/통상 리스크 분석가입니다.
-아래 원문을 읽고 GTI Radar 임원보고용으로 분석하십시오.
-
-절대 금지:
-- 제목 반복 금지
-- 글자크기/이전기사/다음기사/공유/스크롤 같은 웹페이지 UI 문구 출력 금지
-- "관련 뉴스입니다", "공식 규제/공지 후보입니다" 같은 템플릿 문장 금지
-- 본문에 없는 세율/HS/국가/시행일을 지어내지 말 것
-- 본문을 읽을 수 없으면 Summary에 "본문 확인 불가"라고 명시
-
-JSON만 출력:
-{{
-  "Summary": "원문 기준 게시물 요약 2~3줄",
-  "AI Analysis": "삼성전자 관세업무 영향. 수입통관/수출통관/FTA·원산지/HS/관세비용/수출통제 중 해당 항목을 구체적으로 설명",
-  "Action Plan": "즉시조치/1주 내/1개월 내/Owner 형식의 구체적 대응방안",
-  "ExecutiveMessage": "임원용 한 문단 핵심 메시지"
-}}
-
-기본 정보:
-- Content Type: {content_type}
-- Issue: {issue}
-- Samsung Impact: {impact}
-- Affected Products: {products_text}
-- URL: {url}
-- Headline: {headline}
-- Default Action Hint: {default_action}
-
-원문:
-{body_for_prompt[:ARTICLE_MAX_CHARS]}
-""".strip()
-
-    result = call_gemini_json(prompt)
-    if result and not result.get("_error"):
-        summary = clean_article_text_for_gti(result.get("Summary", ""))
-        ai = clean_article_text_for_gti(result.get("AI Analysis", ""))
-        action_plan = clean_article_text_for_gti(result.get("Action Plan", ""))
-        executive = clean_article_text_for_gti(result.get("ExecutiveMessage", ""))
-        if summary and len(summary) >= 30 and ai and len(ai) >= 80 and "글자크기" not in summary and "이전 기사보기" not in summary:
-            final = {
-                "Summary": summary[:900],
-                "AI Analysis": ai[:1400],
-                "Action Plan": action_plan[:1400] if action_plan else default_action,
-                "ExecutiveMessage": (executive or summary)[:800],
-                "article_extract_status": f"GEMINI_OK|body={body_status}|quality={q}",
-            }
-            cache[key] = final
-            _save_gemini_cache()
-            return final
-
-    final = _fallback_gti_analysis_from_body(
-        body=body,
-        headline=headline,
-        issue=issue,
-        impact=impact,
-        products_text=products_text,
-        default_action=default_action,
-        content_type=content_type,
-    )
-    gem_err = clean(result.get("_error", "")) if isinstance(result, dict) else ""
-    final["article_extract_status"] = f"{final.get('article_extract_status')}|body={body_status}|quality={q}|gemini_error={gem_err[:180]}"
-    cache[key] = final
-    _save_gemini_cache()
-    return final
-
-# ======================================================================
-# End of GTI STEP4 Article Cleanup Patch v9.0
-# ======================================================================
-
-
-# ======================================================================
-# GTI STEP4 Gemini Endpoint & Selection Patch v10.0
-# ----------------------------------------------------------------------
-# 보완사항
-# 1) Gemini 404 대응: v1beta/v1 endpoint + 최신 모델 후보 자동 시도
-# 2) Gemini 오류 전체를 article_extract_status에 기록
-# 3) Google News only / 본문 부족 결과는 selected에서 제외 또는 후순위
-# 4) 동일 이슈 반복 기사 중복 축소
-# ======================================================================
-
-GEMINI_API_VERSIONS = []
-for _v in [os.getenv("GTI_GEMINI_API_VERSION", "").strip(), "v1beta", "v1"]:
-    if _v and _v not in GEMINI_API_VERSIONS:
-        GEMINI_API_VERSIONS.append(_v)
-
-GEMINI_MODEL_CANDIDATES = []
-for _m in [
-    os.getenv("GTI_GEMINI_MODEL", "").strip(),
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-flash",
-]:
-    if _m and _m not in GEMINI_MODEL_CANDIDATES:
-        GEMINI_MODEL_CANDIDATES.append(_m)
-
-_LAST_GEMINI_ERROR = ""
-
-def _extract_json_object(text: str) -> dict:
-    txt = clean(text)
-    if not txt:
-        return {}
-    txt = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
-    txt = re.sub(r"\s*```$", "", txt.strip())
-    try:
-        return json.loads(txt)
-    except Exception:
-        pass
-    start = txt.find("{")
-    end = txt.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(txt[start:end+1])
-        except Exception:
-            return {}
-    return {}
-
-def call_gemini_json(prompt: str) -> dict:
-    """v10 override: try API versions + current Gemini model names."""
-    global _LAST_GEMINI_ERROR
-    _LAST_GEMINI_ERROR = ""
-
-    if not USE_GEMINI:
-        _LAST_GEMINI_ERROR = "DISABLED"
-        return {"_error": _LAST_GEMINI_ERROR}
-    if not GEMINI_API_KEY:
-        _LAST_GEMINI_ERROR = "NO_API_KEY"
-        return {"_error": _LAST_GEMINI_ERROR}
-
-    errors = []
-    payloads = [
-        lambda: {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "topP": 0.8,
-                "maxOutputTokens": 1600,
-                "responseMimeType": "application/json",
-            },
-        },
-        lambda: {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "topP": 0.8,
-                "maxOutputTokens": 1600,
-            },
-        },
-    ]
-
-    for api_ver in GEMINI_API_VERSIONS:
-        for model in GEMINI_MODEL_CANDIDATES:
-            endpoint = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            for pidx, make_payload in enumerate(payloads, start=1):
-                try:
-                    payload = make_payload()
-                    data = json.dumps(payload).encode("utf-8")
-                    req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        raw = resp.read().decode("utf-8", "ignore")
-                    out = json.loads(raw)
-
-                    if "error" in out:
-                        msg = out.get("error", {}).get("message", str(out.get("error")))
-                        errors.append(f"{api_ver}/{model}/p{pidx}:API_ERROR:{msg[:180]}")
-                        continue
-
-                    candidates = out.get("candidates") or []
-                    if not candidates:
-                        errors.append(f"{api_ver}/{model}/p{pidx}:NO_CANDIDATE")
-                        continue
-
-                    cand = candidates[0]
-                    finish = cand.get("finishReason", "")
-                    parts = cand.get("content", {}).get("parts", [])
-                    text = "\n".join(clean(part.get("text", "")) for part in parts if isinstance(part, dict))
-                    parsed = _extract_json_object(text)
-                    if parsed:
-                        parsed["_gemini_model"] = model
-                        parsed["_gemini_api_version"] = api_ver
-                        parsed["_gemini_finish"] = finish
-                        _LAST_GEMINI_ERROR = ""
-                        return parsed
-
-                    errors.append(f"{api_ver}/{model}/p{pidx}:NO_JSON finish={finish} text={text[:120]}")
-                except urllib.error.HTTPError as exc:
-                    try:
-                        err_body = exc.read().decode("utf-8", "ignore")[:180]
-                    except Exception:
-                        err_body = ""
-                    errors.append(f"{api_ver}/{model}/p{pidx}:HTTP{exc.code}:{err_body}")
-                except Exception as exc:
-                    errors.append(f"{api_ver}/{model}/p{pidx}:{type(exc).__name__}:{str(exc)[:180]}")
-
-    _LAST_GEMINI_ERROR = " | ".join(errors[-8:]) if errors else "UNKNOWN_GEMINI_ERROR"
-    return {"_error": _LAST_GEMINI_ERROR}
-
-def _bad_selected_body_status(row: pd.Series) -> bool:
-    st = clean(row.get("article_extract_status", ""))
-    s = clean(row.get("Summary", ""))
-    bad = [
-        "GOOGLE_NEWS_ONLY", "TITLE_ONLY", "TOO_SHORT", "UI_NOISE_ONLY",
-        "본문 확인 불가", "글자크기", "이전 기사보기", "다음 기사보기",
-    ]
-    return any(x in st or x in s for x in bad)
-
-def _similar_news_key(row: pd.Series) -> str:
-    title = clean(row.get("Headline", "")).lower()
-    topic = clean(row.get("topic", ""))
-    if any(k in title for k in ["anthropic", "앤트로픽", "미토스", "mythos", "페이블", "fable"]):
-        return "EXPORT_CONTROL_ANTHROPIC_AI_MODEL"
-    if any(k in title for k in ["cbam", "탄소국경"]):
-        return "CBAM"
-    if any(k in title for k in ["anti-dumping", "antidumping", "덤핑방지", "반덤핑"]):
-        return "AD_CVD"
-    title = re.sub(r"[-–—|].*$", "", title)
-    title = re.sub(r"[^a-z0-9가-힣]+", " ", title)
-    return f"{topic}|{title[:80].strip()}"
-
-def _postprocess_daily_quality(daily: pd.DataFrame, audit: pd.DataFrame, excluded: pd.DataFrame):
-    """v10 regulation-safe postprocess.
-
-    This file is STEP4-1 regulation analysis.  A previous patch reused the
-    STEP4-2 news variable NEWS_TARGET_MAX here, which raises NameError in
-    regulation mode.  Regulations should keep all selected official notices
-    up to TOP_N_MAX.
-    """
-    if daily is None or daily.empty:
-        return daily, audit, excluded
-
-    d = daily.copy()
-    if "article_extract_status" not in d.columns:
-        d["article_extract_status"] = ""
-    if "Summary" not in d.columns:
-        d["Summary"] = ""
-
-    d["_bad_body"] = d.apply(_bad_selected_body_status, axis=1)
-    d["_sim_key"] = d.apply(_similar_news_key, axis=1)
-
-    sort_cols, asc = [], []
-    for col, ascending in [("_bad_body", True), ("final_score", False), ("samsung_impact_score", False), ("urgency_score", False)]:
-        if col in d.columns:
-            sort_cols.append(col); asc.append(ascending)
-    if sort_cols:
-        d = d.sort_values(sort_cols, ascending=asc)
-
-    kept = []
-    key_counts = {}
-    for _, r in d.iterrows():
-        key = clean(r.get("_sim_key"))
-        bad = bool(r.get("_bad_body"))
-        max_per_key = 1 if bad else (2 if key == "EXPORT_CONTROL_ANTHROPIC_AI_MODEL" else 1)
-        if key_counts.get(key, 0) >= max_per_key:
-            continue
-        kept.append(r)
-        key_counts[key] = key_counts.get(key, 0) + 1
-
-    out = pd.DataFrame(kept).drop(columns=["_bad_body", "_sim_key"], errors="ignore")
-    reg_target_max = int(globals().get("TOP_N_MAX", 9999))
-    out = out.head(reg_target_max).reset_index(drop=True)
-    if "rank" in out.columns:
-        out["rank"] = range(1, len(out) + 1)
-    return out, audit, excluded
-
-try:
-    _ORIGINAL_BUILD_V10 = build
-    def build(df: pd.DataFrame):
-        daily, audit, excluded = _ORIGINAL_BUILD_V10(df)
-        return _postprocess_daily_quality(daily, audit, excluded)
-except Exception:
-    pass
-
-def _gti_step4_v10_log_once():
-    try:
-        log(f"Gemini API versions: {GEMINI_API_VERSIONS}")
-        log(f"Gemini model candidates v10: {GEMINI_MODEL_CANDIDATES}")
-    except Exception:
-        pass
-
-# ======================================================================
-# End of GTI STEP4 Gemini Endpoint & Selection Patch v10.0
-# ======================================================================
-
-# ======================================================================
-# GTI STEP4-1 Regulation Sensing Patch v11 - 2026-06-14
-# ----------------------------------------------------------------------
-# 목적: 정부/공식기관 신규 게시물 중 관세/통상 업무 변화 후보를
-#      과도하게 탈락시키지 않고 보고서 단계까지 보존한다.
-# 기본조건:
-# - 게시날짜(Publish Date) 보존
-# - 공식 법규/공지 URL 보존
-# - AD/CVD, FTA/원산지, 수출통제, 통관/보세, 관세정책은 old date라도 review 보존
-# - weak_trade_policy_signal 하나만으로 공식기관 공지를 제외하지 않음
-# ======================================================================
-
-if "Publish Date" not in OUTPUT_COLS:
-    try:
-        OUTPUT_COLS.insert(OUTPUT_COLS.index("Date") + 1, "Publish Date")
-    except Exception:
-        OUTPUT_COLS.append("Publish Date")
-
-
-def _v11_text(row) -> str:
-    return " ".join(clean(row.get(c, "")) for c in [
-        "Headline", "Summary", "AI Analysis", "Action Plan", "Agency", "Source",
-        "URL", "KeywordMatches", "Issue", "RejectReason"
-    ]).lower()
-
-
-def _v11_official_trade_source(row) -> bool:
-    blob = _v11_text(row)
-    return any(k in blob for k in [
-        "dgft", "customs", "cbic", "cbp", "ustr", "usitc", "wco", "wto", "taxud",
-        "federalregister.gov", "law.go.kr", "unipass", "mof.go.jp", "customs.go.jp",
-        "관세", "세관", "통관", "유니패스", "국가법령", "법령", "고시", "공고",
-    ])
-
-
-def _v11_actionable_reg_topic(row) -> bool:
-    blob = _v11_text(row)
-    return any(k in blob for k in [
-        "anti-dumping", "antidumping", "countervailing", "ad/cvd", "dumping", "반덤핑", "상계관세", "덤핑방지",
-        "fta", "cepa", "tepa", "origin", "rules of origin", "원산지",
-        "export control", "entity list", "forced labor", "uflpa", "수출통제", "전략물자",
-        "customs", "clearance", "declaration", "bonded", "통관", "보세", "수입신고", "수출신고",
-        "tariff", "customs duty", "import duty", "quota", "관세", "관세율", "쿼터",
-        "hs code", "classification", "품목분류",
-        "export obligation", "advance authorization", "epcg", "e-commerce exporters",
-    ])
-
-
-def _v11_clear_non_customs_noise(row) -> bool:
-    blob = _v11_text(row)
-    if "securities exchange act" in blob or "regulation nms" in blob:
-        return True
-    if any(k in blob for k in ["webinar", "seminar", "conference", "training", "tender", "recruit"]):
-        return True
-    return False
-
-
-def _v11_reference_like(row) -> bool:
-    blob = _v11_text(row)
-    return any(k in blob for k in [
-        "rate of exchange", "exchange rate", "과세환율",
-        "modalities for export of wheat", "export of wheat", "wheat reg",
-    ])
-
-
-def _v11_recoverable_regulation(row) -> bool:
-    reason = clean(row.get("RejectReason", ""))
-    if not reason:
-        return False
-    if _v11_clear_non_customs_noise(row):
-        return False
-    if _v11_actionable_reg_topic(row):
-        return True
-    if _v11_official_trade_source(row) and any(r in reason for r in [
-        "weak_trade_policy_signal",
-        "policy_notice_not_pure_regulation",
-        "review_preserve_ad_cvd_old_date",
-        "old_regulation",
-    ]):
-        return True
-    return False
-
-
-def _v11_adjust_recovered_row(row: pd.Series) -> pd.Series:
-    row = row.copy()
-    blob = _v11_text(row)
-    old_reason = clean(row.get("RejectReason", ""))
-    row["selected"] = True
-    row["RejectReason"] = ("v11_recovered_official_regulation" if not old_reason else f"v11_recovered_official_regulation; previous={old_reason}")
-    row["score"] = max(int(float(row.get("score", 0) or 0)), 62 if _v11_reference_like(row) else 72)
-    row["Risk"] = "하" if _v11_reference_like(row) else ("상" if row["score"] >= 85 else "중")
-    if _v11_reference_like(row):
-        row["Issue"] = "Reference"
-    elif any(k in blob for k in ["anti-dumping", "antidumping", "countervailing", "반덤핑", "상계관세"]):
-        row["Issue"] = "반덤핑/상계관세"
-    elif any(k in blob for k in ["fta", "cepa", "tepa", "origin", "원산지"]):
-        row["Issue"] = "FTA/원산지"
-    elif any(k in blob for k in ["export control", "entity list", "수출통제"]):
-        row["Issue"] = "수출통제"
-    elif any(k in blob for k in ["customs", "clearance", "bonded", "통관", "보세"]):
-        row["Issue"] = "통관/세관"
-    elif any(k in blob for k in ["tariff", "관세", "quota"]):
-        row["Issue"] = "관세정책"
-    return row
-
-
-try:
-    _ORIGINAL_BUILD_V11_REG = build
-
-    def build(df: pd.DataFrame):
-        selected, excluded, audit = _ORIGINAL_BUILD_V11_REG(df)
-        if excluded is None or excluded.empty:
-            return selected, excluded, audit
-
-        recover = excluded[excluded.apply(_v11_recoverable_regulation, axis=1)].copy()
-        if not recover.empty:
-            recover = recover.apply(_v11_adjust_recovered_row, axis=1)
-            selected = pd.concat([selected, recover], ignore_index=True, sort=False)
-            selected["_v11_key"] = selected["URL"].fillna("").astype(str).str.lower().str.strip()
-            selected["_v11_key"] = selected["_v11_key"].where(selected["_v11_key"].ne(""), selected["Headline"].fillna("").astype(str).str.lower().str.strip())
-            selected = selected.drop_duplicates(subset=["_v11_key"], keep="first").drop(columns=["_v11_key"], errors="ignore")
-            selected = selected.sort_values(["score", "Date"], ascending=[False, False]).reset_index(drop=True)
-
-            recover_keys = set(recover["URL"].fillna("").astype(str).str.lower().str.strip())
-            excluded = excluded[~excluded["URL"].fillna("").astype(str).str.lower().str.strip().isin(recover_keys)].reset_index(drop=True)
-        return selected, excluded, audit
-except Exception:
-    pass
-
-
-# ======================================================================
-# GTI STEP4-1 Regulation Sensing Patch v12 - 2026-06-14
-# ----------------------------------------------------------------------
-# 목적 기준 보완:
-# - Publish Date가 NaN/공란이면 "확인 필요"로 표시한다.
-# - 법규는 목록에 보존하되, 관세/통상 실행 키워드가 없는 일반 법규는
-#   Top3 오승격을 막기 위해 Reference로 분류한다.
-# ======================================================================
-
-def _v12_clean_text(v) -> str:
-    try:
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
-    return clean(v)
-
-
-def _v12_publish_date(row) -> str:
-    for c in ["Publish Date", "Date", "published", "published_at", "collected_at", "last_checked"]:
-        v = _v12_clean_text(row.get(c, ""))
-        if v and v.lower() not in {"nan", "nat", "none"}:
-            return v
-    return "확인 필요"
-
-
-def _v12_reg_blob(row) -> str:
-    return " ".join(_v12_clean_text(row.get(c, "")) for c in [
-        "Headline", "Title", "Summary", "AI Analysis", "Action Plan",
-        "OriginalArticle", "article_body", "body", "KeywordMatches", "Agency", "Source", "URL",
-    ]).lower()
-
-
-# ======================================================================
-# GTI STEP4-1 Regulation Sensing Patch v13 - 2026-06-14
-# ----------------------------------------------------------------------
-# UNIPASS 공지 URL 보정:
-# rowTitle 검색 URL은 메일/엑셀에서 클릭 실패 가능성이 높으므로 ntarId 직접열람
-# URL로 변환한다.  추가 ntarId는 이 사전에 계속 확장하면 된다.
-# ======================================================================
-
-UNIPASS_NOTICE_URL_PREFIX_V13 = (
-    "https://unipass.customs.go.kr/csp/myc/custsppt/cmmn/"
-    "NtarBrkdMtCtr/openMYC0605014Q.do?ntarId="
-)
-
-UNIPASS_NOTICE_ID_BY_TITLE_V13 = {
-    "다수 사업장 운영 사업자의 전자상거래업자 등록 신청 방법": "202606122928",
-}
-
-
-def _v13_normalize_title(text: str) -> str:
-    text = unquote(_v12_clean_text(text))
-    text = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", text)
-    text = re.sub(r"[^0-9A-Za-z가-힣]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def _v13_extract_row_title_from_url(url: str) -> str:
-    u = _v12_clean_text(url)
-    m = re.search(r"[?&]rowTitle=([^&]+)", u, flags=re.I)
-    return unquote(m.group(1)) if m else ""
-
-
-def _v13_unipass_direct_url(row) -> str:
-    values = [
-        row.get("Headline", ""),
-        row.get("Title", ""),
-        _v13_extract_row_title_from_url(row.get("URL", "")),
-        _v13_extract_row_title_from_url(row.get("Source", "")),
-    ]
-    norm_values = [_v13_normalize_title(v) for v in values if _v12_clean_text(v)]
-    for key, ntar_id in UNIPASS_NOTICE_ID_BY_TITLE_V13.items():
-        norm_key = _v13_normalize_title(key)
-        if any(norm_key and (norm_key in v or v in norm_key) for v in norm_values):
-            return UNIPASS_NOTICE_URL_PREFIX_V13 + ntar_id
-    return ""
-
-
-def _v13_fix_unipass_url(row) -> str:
-    direct = _v13_unipass_direct_url(row)
-    if direct:
-        return direct
-    url = _v12_clean_text(row.get("URL", ""))
-    low = url.lower()
-    if "unipass.customs.go.kr" in low and "openmyc0605014q.do" in low and "ntarid=" in low:
-        return url
-    return url
-
-
-def _v12_reg_issue(row) -> str:
-    text = _v12_reg_blob(row)
-    title = _v12_clean_text(row.get("Headline", "")).lower()
-    # 제목만으로 참고성 공지임이 분명한 항목은 넓은 fallback/keyword 문구보다 먼저 강등한다.
-    if any(k in title for k in ["rate of exchange", "exchange rate", "과세환율", "export of wheat", "wheat reg"]):
-        return "Reference"
-    if any(k in title for k in [
-        "인공지능이용자보호", "인공지능", "ai user", "agricultural policy", "política agrícola",
-        "공동농업정책", "농업정책",
-    ]):
-        return "Reference"
-    generic_notice = (
-        "public notice" in title or "publick notice" in title or "trade notice" in title or "trrade notice" in title
-        or any(k in title for k in ["credit assistance", "emerging export opportunities", "interest subvention", "collateral support", "bank validation", "testing inspections", "labsetu"])
-    )
-    if generic_notice:
-        concrete_title = any(k in title for k in [
-            "anti-dumping", "antidumping", "countervailing", "ad/cvd", "덤핑", "상계관세",
-            "export obligation", "advance authorization", "epcg",
-            "fta", "cepa", "tepa", "origin", "원산지",
-            "customs duty", "import duty", "tariff", "관세", "통관", "보세",
-        ])
-        if not concrete_title:
-            return "Reference"
-    if any(k in text for k in ["anti-dumping", "antidumping", "countervailing", "ad/cvd", "덤핑", "상계관세", "덤핑방지"]):
-        return "반덤핑/상계관세"
-    if any(k in text for k in ["export control", "entity list", "uflpa", "forced labor", "수출통제", "전략물자", "강제노동"]):
-        return "수출통제"
-    if any(k in text for k in ["cbam", "carbon border", "탄소국경"]):
-        return "CBAM"
-    if (
-        any(k in text for k in ["fta", "cepa", "tepa", "rules of origin", "certificate of origin", "원산지", "협정세율"])
-        or re.search(r"\borigin\b", text)
-    ):
-        return "FTA/원산지"
-    if any(k in text for k in [
-        "export obligation", "advance authorization", "epcg", "e-commerce exporter", "electronic commerce exporter",
-        "customs clearance", "customs declaration", "bonded", "bonded warehouse",
-        "수출의무", "전자상거래업자", "통관절차", "수입신고", "수출신고", "보세", "보세창고", "과세가격",
-    ]):
-        return "통관/세관"
-    if any(k in text for k in ["customs duty", "import duty", "tariff rate", "tariff quota", "hs code", "classification", "관세율", "할당관세", "품목분류"]):
-        return "관세정책"
-    return "Reference"
-
-
-def to_output(df, content_type="Regulation"):
-    rows = []
-    for i, r in df.reset_index(drop=True).iterrows():
-        issue = _v12_reg_issue(r)
-        impact = "Reference" if issue == "Reference" else "Watch"
-        pub_date = _v12_publish_date(r)
-        rows.append({
-            "No": i + 1,
-            "Content Type": content_type,
-            "Mail Group": "Regulation" if content_type == "Regulation" else "News",
-            "Samsung Impact": impact,
-            "Affected Subsidiary": "관련 법인 검토",
-            "Impact Reason": "official_trade_regulation_watch",
-            "Date": pub_date,
-            "Publish Date": pub_date,
-            "Headline": r.get("Headline", ""),
-            "Summary": r.get("Summary", ""),
-            "AI Analysis": r.get("AI Analysis", ""),
-            "Action Plan": r.get("Action Plan", ""),
-            "Country": "",
-            "Agency": r.get("Agency", ""),
-            "Risk": r.get("Risk", ""),
-            "Importance Score": int(float(r.get("score", 0) or 0)),
-            "Priority Group": "REFERENCE" if issue == "Reference" else ("CORE" if int(float(r.get("score", 0) or 0)) >= 85 else "USABLE"),
-            "Issue": issue,
-            "Cluster": r.get("Headline", ""),
-            "URL": _v13_fix_unipass_url(r),
-            "Source": r.get("Source", ""),
-            "Source File": "3-1.regulation_article_summary.xlsx",
-            "RejectReason": r.get("RejectReason", ""),
-            "KeywordMatches": r.get("KeywordMatches", ""),
-            "effective_date_hint": r.get("effective_date_hint", "본문에서 확인 불가"),
-            "hs_hint": r.get("hs_hint", "본문에서 확인 불가"),
-            "tariff_rate_hint": r.get("tariff_rate_hint", "본문에서 확인 불가"),
-        })
-    return pd.DataFrame(rows, columns=OUTPUT_COLS)
-
-
-def normalize_cum_cols(df):
-    df = normalize_columns(df)
-    for c in OUTPUT_COLS:
-        if c not in df.columns:
-            df[c] = ""
-    if "Publish Date" in df.columns:
-        pub = df["Publish Date"].astype(str).str.strip()
-        dt = df.get("Date", "").astype(str).str.strip() if "Date" in df.columns else ""
-        df["Publish Date"] = df["Publish Date"].where(pub.ne("") & ~pub.str.lower().isin(["nan", "nat", "none"]), dt)
-        df["Publish Date"] = df["Publish Date"].where(df["Publish Date"].astype(str).str.strip().ne(""), "확인 필요")
-    if "Date" in df.columns:
-        df["Date"] = df["Date"].where(df["Date"].astype(str).str.strip().ne("") & ~df["Date"].astype(str).str.lower().isin(["nan", "nat", "none"]), df.get("Publish Date", "확인 필요"))
-    return df[OUTPUT_COLS]
-
-
-def _v15_text(value):
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value).strip()
-
-
-def _v15_blob(row):
-    parts = []
-    for col in [
-        "Headline", "Summary", "AI Analysis", "Action Plan", "Issue",
-        "Samsung Impact", "Agency", "Source", "RejectReason",
-        "KeywordMatches", "URL", "Publish Date", "Date",
-    ]:
-        if col in row.index:
-            parts.append(_v15_text(row.get(col)))
-    return " ".join(parts).lower()
-
-
-def _v15_parse_date(value):
-    text = _v15_text(value)
-    if not text or text.lower() in {"nan", "nat", "none"}:
-        return pd.NaT
-    if "확인" in text or "?" in text:
-        return pd.NaT
-    return pd.to_datetime(text, errors="coerce")
-
-
-def _v15_is_pn51(row):
-    return "pn 51" in _v15_blob(row) and "export obligation" in _v15_blob(row)
-
-
-def _v15_is_reportable_regulation(row):
-    """Final gate for executive regulation report rows."""
-    blob = _v15_blob(row)
-    headline = _v15_text(row.get("Headline")).lower()
-    issue = _v15_text(row.get("Issue"))
-    impact = _v15_text(row.get("Samsung Impact"))
-
-    if _v15_is_pn51(row):
-        return True
-
-    hard_noise = [
-        "rate of exchange",
-        "public notice no.",
-        "public notice no ",
-        "public notice ",
-        "public notice eng",
-        "public notice english",
-        "ai이용자보호",
-        "인공지능이용자보호",
-        "공동농업정책",
-        "securities exchange act",
-        "regulation nms",
-    ]
-    if any(k in headline for k in hard_noise):
-        strong_exception = any(k in blob for k in [
-            "anti-dumping", "antidumping", "countervailing", "safeguard",
-            "customs duty", "tariff quota", "rules of origin", "certificate of origin",
-            "export obligation", "advance authorization", "epcg",
-            "반덤핑", "상계관세", "덤핑방지", "관세율", "관세쿼터", "원산지", "수출의무",
-        ])
-        if not strong_exception:
-            return False
-
-    if issue == "Reference" or impact == "Reference":
-        return False
-
-    pub = _v15_parse_date(row.get("Publish Date", row.get("Date", "")))
-    if pd.isna(pub):
-        # No publish date is allowed only for strong trade/customs execution items.
-        if not any(k in blob for k in [
-            "anti-dumping", "antidumping", "countervailing", "customs", "tariff",
-            "rules of origin", "certificate of origin", "export obligation",
-            "advance authorization", "epcg", "fta", "cepa", "tepa",
-            "반덤핑", "상계관세", "관세", "통관", "원산지", "수출의무",
-        ]):
-            return False
-    else:
-        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=int(os.getenv("GTI_STEP4_REG_MAX_AGE_DAYS", "120")))
-        if pub.normalize() < cutoff:
-            if not any(k in blob for k in ["anti-dumping", "antidumping", "countervailing", "반덤핑", "상계관세", "덤핑방지"]):
-                return False
-
-    bad_summary = [
-        "본문 내용이 파싱되지 않아",
-        "본문 확인 불가",
-        "상세 내용은 확인 불가",
-        "구체적인 내용은 확인하기 어렵습니다",
-        "pdf 파일이 짧아",
-        "확인 불가합니다",
-    ]
-    if any(k in blob for k in bad_summary):
-        if not any(k in blob for k in ["anti-dumping", "antidumping", "countervailing", "반덤핑", "상계관세", "pn 51", "export obligation"]):
-            return False
-
-    return True
-
-
-def _v15_split_reg_daily(daily):
-    if daily is None or daily.empty:
-        return daily, pd.DataFrame(columns=getattr(daily, "columns", OUTPUT_COLS))
-    d = daily.copy()
-    keep = d.apply(_v15_is_reportable_regulation, axis=1)
-    kept = d[keep].copy().reset_index(drop=True)
-    removed = d[~keep].copy().reset_index(drop=True)
-    if not removed.empty:
-        removed["RejectReason"] = removed.get("RejectReason", "").fillna("").astype(str).apply(
-            lambda v: (v + "; " if v else "") + "v15_final_not_reportable_regulation"
-        )
-    if not kept.empty and "No" in kept.columns:
-        kept["No"] = range(1, len(kept) + 1)
-    return kept, removed
-
-
-
-# ======================================================================
-# GTI STEP4-1 Samsung Customs Regulation Priority Patch v16b
-# ASCII source, Korean terms decoded at runtime to avoid Windows codepage loss.
-# ======================================================================
-
-def _v16u(s: str) -> str:
-    return s.encode("ascii").decode("unicode_escape")
-
-V16_CRITICAL_RULES = [
-    (_v16u(r"\uad00\uc138\uc815\ucc45"), "Direct", 120, [_v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870"), _v16u(r"\ud560\ub2f9\uad00\uc138"), _v16u(r"\uad00\uc138\uc728"), _v16u(r"\uad00\uc138\ucffc\ud130"), "tariff quota", "tariff rate", "customs duty", "import duty"]),
-    (_v16u(r"FTA/\uc6d0\uc0b0\uc9c0"), "Direct", 115, [_v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "FTA", "fta", "CEPA", "cepa", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0"), _v16u(r"\uc6d0\uc0b0\uc9c0\uc99d\uba85"), "rules of origin", "certificate of origin"]),
-    (_v16u(r"HS/\ud488\ubaa9\ubd84\ub958"), "Direct", 110, [_v16u(r"\ud488\ubaa9\ubd84\ub958"), "HS", "hs code", "classification"]),
-    (_v16u(r"\uc218\ucd9c\ud1b5\uc81c"), "Direct", 115, [_v16u(r"\uc218\ucd9c\ud1b5\uc81c"), _v16u(r"\uc804\ub7b5\ubb3c\uc790"), _v16u(r"\uc774\uc911\uc6a9\ub3c4"), "entity list", "export control", "dual-use", "UFLPA", "forced labor"]),
-    (_v16u(r"\ubc18\ub364\ud551/\uc0c1\uacc4\uad00\uc138"), "Direct", 115, [_v16u(r"\ubc18\ub364\ud551"), _v16u(r"\ub364\ud551\ubc29\uc9c0"), _v16u(r"\uc0c1\uacc4\uad00\uc138"), _v16u(r"\uc138\uc774\ud504\uac00\ub4dc"), "anti-dumping", "antidumping", "countervailing", "safeguard", "AD/CVD"]),
-    (_v16u(r"\ud1b5\uad00/\uc138\uad00"), "Indirect", 95, [_v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9"), _v16u(r"\uac80\uc0ac\ube44\uc6a9 \uc9c0\uc6d0"), _v16u(r"\uc218\uc785\uc2e0\uace0"), _v16u(r"\uc218\ucd9c\uc2e0\uace0"), _v16u(r"\ud1b5\uad00"), _v16u(r"\uc138\uad00\uc7a5\ud655\uc778"), _v16u(r"\ud1b5\ud569\uacf5\uace0"), _v16u(r"\ubcf4\uc138"), "customs clearance", "customs declaration"]),
-    ("CBAM", "Indirect", 100, ["CBAM", "carbon border", _v16u(r"\ud0c4\uc18c\uad6d\uacbd")]),
-]
-
-V16_ADMIN_NOISE_TERMS = [
-    _v16u(r"\uad00\uc138\uccad\uacfc \uadf8 \uc18c\uc18d\uae30\uad00 \uc9c1\uc81c"), _v16u(r"\uc9c1\uc81c \uc2dc\ud589\uaddc\uce59"),
-    _v16u(r"\ubd80\uc815\uccad\ud0c1"), _v16u(r"\uae08\ud488\ub4f1 \uc218\uc218"), _v16u(r"\uc9c8\uc11c\uc704\ubc18\ud589\uc704\uaddc\uc81c\ubc95"),
-    _v16u(r"\uc2b9\uac1d\uc608\uc57d\uc790\ub8cc"), _v16u(r"\uc9c0\ubc29\ud589\uc815\uccb4\uc81c"), _v16u(r"\uc120\ubc15\uad50\ud1b5\uad00\uc81c"),
-    _v16u(r"\ubcf4\uc138\ud310\ub9e4\uc7a5"), _v16u(r"\ub300\ud1b5\ub839\ub839 \uc81c"), _v16u(r"\uac1c\ubcc4\uc18c\ube44\uc138\ubc95 \uc2dc\ud589\ub839"),
-]
-
-V16_NON_TRADE_LAW_TERMS = [_v16u(r"\uc0dd\ud65c\ud654\ud559\uc81c\ud488"), _v16u(r"\ubc29\uc704\uc0ac\uc5c5\ubc95 \uc2dc\ud589\uaddc\uce59"), _v16u(r"\uc758\ub8cc\uae30\uae30\ubc95 \uc2dc\ud589\uaddc\uce59")]
-V16_OFFICIAL_SOURCE_HINTS = [_v16u(r"\uad00\uc138\uccad"), _v16u(r"\uc720\ub2c8\ud328\uc2a4"), _v16u(r"\uad6d\uac00\ubc95\ub839\uc815\ubcf4\uc13c\ud130"), "law.go.kr", "unipass.customs.go.kr", "customs.go.kr", "gwanbo.go.kr", "clhs.co.kr", "federalregister.gov", "cbp.gov", "ustr.gov", "usitc.gov", "dgft.gov.in", "cbic.gov.in", "mofcom.gov.cn", "customs.gov.cn", "gacc.gov.cn", "moit.gov.vn"]
-
-
-def _v16_text(value) -> str:
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value or "").strip()
-
-
-def _v16_blob(row) -> str:
-    cols = ["Headline", "Title", "title", "headline", "Summary", "AI Analysis", "Action Plan", "article_body", "regulation_fallback_body", "KeywordMatches", "Agency", "agency", "Source", "source", "URL", "url", "effective_date_hint", "hs_hint", "tariff_rate_hint"]
-    return " ".join(_v16_text(row.get(c, "")) for c in cols).lower()
-
-
-def _v16_title(row) -> str:
-    for c in ["Headline", "headline", "Title", "title"]:
-        v = _v16_text(row.get(c, ""))
-        if v:
-            return v
-    return ""
-
-
-def _v16_matches(blob: str, terms) -> list[str]:
-    return [t for t in terms if str(t).lower() in blob]
-
-
-def _v16_priority(row) -> dict:
-    blob = _v16_blob(row)
-    title_l = _v16_title(row).lower()
-    best = {"issue": "Reference", "impact": "Reference", "score": 0, "terms": []}
-    for issue, impact, base_score, terms in V16_CRITICAL_RULES:
-        found = _v16_matches(blob, terms)
-        if not found:
-            continue
-        title_bonus = 12 if _v16_matches(title_l, terms) else 0
-        official_bonus = 8 if any(x.lower() in blob for x in V16_OFFICIAL_SOURCE_HINTS) else 0
-        score = base_score + min(len(found), 4) * 4 + title_bonus + official_bonus
-        if score > best["score"]:
-            best = {"issue": issue, "impact": impact, "score": score, "terms": found}
-    return best
-
-
-def _v16_is_admin_noise(row) -> bool:
-    blob = _v16_blob(row)
-    title = _v16_title(row).lower()
-    priority = _v16_priority(row)
-    if priority["score"] >= 110:
-        return False
-    if any(t.lower() in title for t in V16_ADMIN_NOISE_TERMS):
-        return True
-    if any(t.lower() in title for t in V16_NON_TRADE_LAW_TERMS) and priority["score"] < 120:
-        return True
-    return False
-
-
-def _v16_summary(row, issue: str) -> str:
-    title_body = f"{_v16_title(row)} {_v16_text(row.get('Summary', ''))} {_v16_text(row.get('article_body', ''))}"
-    if _v16u(r"\ud560\ub2f9\uad00\uc138") in title_body or _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870") in title_body:
-        return _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870\uc5d0 \ub530\ub978 \ud560\ub2f9\uad00\uc138 \uc801\uc6a9/\ucd94\ucc9c \uc694\uac74 \uad00\ub828 \ubc95\uaddc\uc785\ub2c8\ub2e4. \ub300\uc0c1 \ud488\ubaa9, \uc801\uc6a9 \uc138\uc728, \ucd94\ucc9c\uc11c\u00b7\uc99d\ube59 \uc694\uac74, \uc2dc\ud589\uae30\uac04\uc744 \uc218\uc785 \ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \ub300\uc870\ud574\uc57c \ud569\ub2c8\ub2e4.")
-    if any(x in title_body for x in [_v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "FTA", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0")]):
-        return _v16u(r"FTA \ud611\uc815\uc138\uc728 \ub610\ub294 \uc6d0\uc0b0\uc9c0 \uc99d\uba85\u00b7\ud310\uc815 \uc808\ucc28\uc640 \uad00\ub828\ub41c \ubc95\uaddc/\uacf5\uc9c0\uc785\ub2c8\ub2e4. \ud611\uc815\ubcc4 \uc138\uc728, \uc6d0\uc0b0\uc9c0 \uc99d\ube59, BOM/HS \uae30\uc900 \ubc18\uc601 \uc5ec\ubd80\uac00 \ud575\uc2ec\uc785\ub2c8\ub2e4.")
-    if any(x in title_body for x in [_v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9"), _v16u(r"\uac80\uc0ac\ube44\uc6a9 \uc9c0\uc6d0")]):
-        return _v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9 \uc9c0\uc6d0 \uc0ac\ubb34\ucc98\ub9ac \uad00\ub828 \uace0\uc2dc\uc785\ub2c8\ub2e4. \uac80\uc0ac \ub300\uc0c1 \uc218\uc785\ud654\ubb3c, \ube44\uc6a9 \uc9c0\uc6d0 \uac00\ub2a5 \uc5ec\ubd80, \ud1b5\uad00 \ube44\uc6a9 \ud68c\uc218 \uc808\ucc28\ub97c \ud655\uc778\ud574\uc57c \ud569\ub2c8\ub2e4.")
-    return (_v16_text(row.get("Summary", "")) or f"{_v16_title(row)} official regulation requiring customs review.")[:700]
-
-
-def _v16_action(row, issue: str) -> str:
-    title_body = f"{_v16_title(row)} {_v16_text(row.get('Summary', ''))} {_v16_text(row.get('article_body', ''))}"
-    if _v16u(r"\ud560\ub2f9\uad00\uc138") in title_body or _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870") in title_body:
-        return _v16u(r"\uc989\uc2dc\uc870\uce58: \ud558\ubc18\uae30 \ud560\ub2f9\uad00\uc138 HS \ub9ac\uc2a4\ud2b8\uc640 \uc0bc\uc131\uc804\uc790/1\ucc28 \ud611\ub825\uc0ac \uc218\uc785 \uc6d0\ubd80\uc790\uc7ac \ub9c8\uc2a4\ud130\ub97c \uad50\ucc28 \ub9e4\ud551\ud558\uc2ed\uc2dc\uc624. 1\uc8fc \ub0b4: \ucd94\ucc9c\uc11c\u00b7\uc99d\ube59\u00b7\uc218\uc785\uc2e0\uace0 \uc808\ucc28\ub97c \uad00\uc138\uc0ac/\uad6c\ub9e4\uc640 \ud655\uc815\ud558\uc2ed\uc2dc\uc624. Owner: HQ Customs + \uad6c\ub9e4 + \ubb3c\ub958")
-    if any(x in title_body for x in [_v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "FTA", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0")]):
-        return _v16u(r"\uc989\uc2dc\uc870\uce58: \ub300\uc0c1 \ud611\uc815\uacfc \ud488\ubaa9\ubcc4 HS/\ud611\uc815\uc138\uc728 \ubcc0\uacbd \uc5ec\ubd80\ub97c \ud655\uc778\ud558\uc2ed\uc2dc\uc624. 1\uc8fc \ub0b4: BOM \uae30\uc900 \uc6d0\uc0b0\uc9c0 \ud310\uc815, \uc6d0\uc0b0\uc9c0\uc99d\uba85\uc11c \ubc1c\uae09/\ubcf4\uad00 \uc694\uac74, \ud611\ub825\uc0ac \uc6d0\uc0b0\uc9c0\ud655\uc778\uc11c \uc601\ud5a5\uc744 \uc810\uac80\ud558\uc2ed\uc2dc\uc624. Owner: FTA/Origin + Customs IT")
-    if issue == _v16u(r"\uc218\ucd9c\ud1b5\uc81c"):
-        return _v16u(r"\uc989\uc2dc\uc870\uce58: \ub300\uc0c1 \ud488\ubaa9\uc758 \uc804\ub7b5\ubb3c\uc790/ECCN \ud574\ub2f9 \uc5ec\ubd80\uc640 \ucd5c\uc885 \uc0ac\uc6a9\uc790 \uc2a4\ud06c\ub9ac\ub2dd\uc744 \ud655\uc778\ud558\uc2ed\uc2dc\uc624. Owner: Export Control + \ubc95\ubb34 + \uc0ac\uc5c5\ubd80")
-    return _v16u(r"\uc989\uc2dc\uc870\uce58: \uc6d0\ubb38 \uae30\uc900 \uc2dc\ud589\uc77c, \uc801\uc6a9 \ud488\ubaa9, HS, \uc138\uc728, \uc2e0\uace0\uc808\ucc28 \ubcc0\uacbd \uc5ec\ubd80\ub97c \ud655\uc778\ud558\uc2ed\uc2dc\uc624. 1\uc8fc \ub0b4: \uad00\ub828 \ubc95\uc778/\ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \uc601\ud5a5 \uc5ec\ubd80\ub97c \ub9e4\ud551\ud558\uc2ed\uc2dc\uc624. Owner: \uad00\uc138/\ud1b5\uc0c1 \ub9ac\uc2a4\ud06c \ubd84\uc11d\ud300")
-
-
-def _v16_country(row) -> str:
-    blob = _v16_blob(row)
-    if any(x in blob for x in [_v16u(r"\uad00\uc138\uccad"), _v16u(r"\uc720\ub2c8\ud328\uc2a4"), "law.go.kr", _v16u(r"\ub300\ud55c\ubbfc\uad6d"), _v16u(r"\ud55c\uad6d")]):
-        return _v16u(r"\ud55c\uad6d")
-    if any(x in blob for x in ["vietnam", "moit.gov.vn", "customs.gov.vn"]): return _v16u(r"\ubca0\ud2b8\ub0a8")
-    if any(x in blob for x in ["india", "dgft", "cbic"]): return _v16u(r"\uc778\ub3c4")
-    if any(x in blob for x in ["china", "mofcom", "gacc", "customs.gov.cn"]): return _v16u(r"\uc911\uad6d")
-    if any(x in blob for x in ["europa", "european", " eu "]): return "EU"
-    if any(x in blob for x in ["federalregister", "cbp.gov", "ustr.gov", "usitc.gov", "united states", " u.s."]): return _v16u(r"\ubbf8\uad6d")
-    return _v16u(r"\uad00\ub828\uad6d")
-
-
-def _v16_risk(issue: str, impact: str, score: int) -> str:
-    return _v16u(r"\uc0c1") if impact == "Direct" or score >= 120 else _v16u(r"\uc911")
-
-_v16_to_output_base = to_output
-
-def to_output(df, content_type="Regulation"):
-    if content_type != "Regulation":
-        return _v16_to_output_base(df, content_type)
-    rows = []
-    if df is None:
-        df = pd.DataFrame()
-    for _, r in df.reset_index(drop=True).iterrows():
-        priority = _v16_priority(r)
-        issue = priority["issue"] if priority["issue"] != "Reference" else _v12_reg_issue(r)
-        if issue == "Reference":
-            impact = "Reference"
-            score = int(float(r.get("score", 0) or 0))
-        else:
-            impact = priority["impact"] if priority["impact"] != "Reference" else "Watch"
-            score = max(int(float(r.get("score", 0) or 0)), int(priority["score"]))
-        title = _v16_title(r)
-        pub_date = _v12_publish_date(r)
-        rows.append({
-            "No": len(rows) + 1, "Content Type": content_type, "Mail Group": "Regulation", "Samsung Impact": impact,
-            "Affected Subsidiary": _v16u(r"\ud55c\uad6d/\uc8fc\uc694 \uc0dd\uc0b0\ubc95\uc778 \ubc0f \uad00\ub828 \uc218\uc785\u00b7\uc218\ucd9c \ubc95\uc778"),
-            "Impact Reason": "v16_samsung_customs_law_priority:" + ",".join(priority.get("terms", [])[:5]),
-            "Date": pub_date, "Publish Date": pub_date, "Headline": title, "Summary": _v16_summary(r, issue),
-            "AI Analysis": _v16u(r"\uc0bc\uc131\uc804\uc790 \uad00\uc138 \ub2f4\ub2f9 \uad00\uc810\uc5d0\uc11c \uc218\uc785\ud1b5\uad00, FTA\u00b7\uc6d0\uc0b0\uc9c0, HS/\ud488\ubaa9\ubd84\ub958, \uad00\uc138\ube44\uc6a9 \ub610\ub294 \uc218\ucd9c\ud1b5\uc81c \uc808\ucc28\uc5d0 \uc601\ud5a5\uc744 \uc904 \uc218 \uc788\ub294 \uacf5\uc2dd \ubc95\uaddc\uc785\ub2c8\ub2e4. \uc6d0\ubb38 \uae30\uc900 \uc801\uc6a9 \ud488\ubaa9\u00b7HS\u00b7\uc138\uc728\u00b7\uc2dc\ud589\uc77c\u00b7\uc99d\ube59\uc694\uac74\uc744 \ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \ub300\uc870\ud574\uc57c \ud569\ub2c8\ub2e4."),
-            "Action Plan": _v16_action(r, issue), "Country": _v16_country(r), "Agency": _v16_text(r.get("Agency", r.get("agency", ""))),
-            "Risk": _v16_risk(issue, impact, score), "Importance Score": score,
-            "Priority Group": "CORE" if score >= 110 else ("USABLE" if impact != "Reference" else "REFERENCE"),
-            "Issue": issue, "Cluster": title, "URL": _v13_fix_unipass_url(r), "Source": _v16_text(r.get("Source", r.get("source", ""))),
-            "Source File": "3-1.regulation_article_summary.xlsx", "RejectReason": _v16_text(r.get("RejectReason", "")),
-            "KeywordMatches": _v16_text(r.get("KeywordMatches", ",".join(priority.get("terms", [])))),
-            "effective_date_hint": _v16_text(r.get("effective_date_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
-            "hs_hint": _v16_text(r.get("hs_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
-            "tariff_rate_hint": _v16_text(r.get("tariff_rate_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
-            "article_extract_status": _v16_text(r.get("article_extract_status", "")), "ExecutiveMessage": _v16_summary(r, issue)[:500],
-        })
-    return pd.DataFrame(rows, columns=OUTPUT_COLS)
-
-_v16_reportable_base = _v15_is_reportable_regulation
-
-def _v15_is_reportable_regulation(row):
-    if _v16_is_admin_noise(row):
-        return False
-    priority = _v16_priority(row)
-    if priority["score"] >= 95:
-        return True
-    return _v16_reportable_base(row)
-
-_v16_split_base = _v15_split_reg_daily
-
-def _v15_split_reg_daily(daily):
-    kept, removed = _v16_split_base(daily)
-    if kept is None or kept.empty:
-        return kept, removed
-    kept = kept.copy()
-    kept["_v16_score"] = kept.apply(lambda r: _v16_priority(r).get("score", 0), axis=1)
-    kept["_v16_issue_rank"] = kept["Issue"].map({_v16u(r"\uad00\uc138\uc815\ucc45"):10, _v16u(r"FTA/\uc6d0\uc0b0\uc9c0"):9, _v16u(r"\uc218\ucd9c\ud1b5\uc81c"):8, _v16u(r"\ubc18\ub364\ud551/\uc0c1\uacc4\uad00\uc138"):8, _v16u(r"HS/\ud488\ubaa9\ubd84\ub958"):7, _v16u(r"\ud1b5\uad00/\uc138\uad00"):6, "CBAM":5}).fillna(1)
-    kept = kept.sort_values(["_v16_score", "_v16_issue_rank", "Importance Score"], ascending=[False, False, False])
-    limit = int(os.getenv("GTI_STEP4_REG_REPORT_MAX", "8"))
-    overflow = pd.DataFrame(columns=kept.columns)
-    if limit > 0 and len(kept) > limit:
-        overflow = kept.iloc[limit:].copy()
-        kept = kept.iloc[:limit].copy()
-        overflow["RejectReason"] = overflow.get("RejectReason", "").fillna("").astype(str).apply(lambda v: (v + "; " if v else "") + "v16_over_report_limit_lower_priority")
-    kept = kept.drop(columns=["_v16_score", "_v16_issue_rank"], errors="ignore").reset_index(drop=True)
-    if not overflow.empty:
-        overflow = overflow.drop(columns=["_v16_score", "_v16_issue_rank"], errors="ignore").reset_index(drop=True)
-        removed = pd.concat([removed, overflow], ignore_index=True, sort=False) if removed is not None else overflow
-    if "No" in kept.columns:
-        kept["No"] = range(1, len(kept) + 1)
-    return kept, removed
-
-# ======================================================================
-# End of GTI STEP4-1 Samsung Customs Regulation Priority Patch v16b
-# ======================================================================
-
-
-# ======================================================================
-# GTI STEP4-1 v16c: classify only from original/title/source fields.
-# Previous AI/Action text can contain broad FTA fallback wording and must not
-# influence regulation sensing.
-# ======================================================================
-
-def _v16_source_blob(row) -> str:
-    cols = [
-        "Headline", "Title", "title", "headline", "article_body", "regulation_fallback_body",
-        "original_url", "URL", "url", "Agency", "agency", "Source", "source",
-        "effective_date_hint", "hs_hint", "tariff_rate_hint", "official_regulation_reason",
-        "protected_regulation_reason", "matched_policy_terms",
-    ]
-    return " ".join(_v16_text(row.get(c, "")) for c in cols).lower()
-
-
-def _v16_priority(row) -> dict:
-    blob = _v16_source_blob(row)
-    title_l = _v16_title(row).lower()
-    best = {"issue": "Reference", "impact": "Reference", "score": 0, "terms": []}
-    for issue, impact, base_score, terms in V16_CRITICAL_RULES:
-        found = _v16_matches(blob, terms)
-        if not found:
-            continue
-        title_bonus = 18 if _v16_matches(title_l, terms) else 0
-        official_bonus = 8 if any(x.lower() in blob for x in V16_OFFICIAL_SOURCE_HINTS) else 0
-        score = base_score + min(len(found), 4) * 4 + title_bonus + official_bonus
-        if score > best["score"]:
-            best = {"issue": issue, "impact": impact, "score": score, "terms": found}
-    return best
-
-
-def _v16_is_admin_noise(row) -> bool:
-    title = _v16_title(row).lower()
-    priority = _v16_priority(row)
-    if priority["score"] >= 115:
-        return False
-    if any(t.lower() in title for t in V16_ADMIN_NOISE_TERMS):
-        return True
-    if any(t.lower() in title for t in V16_NON_TRADE_LAW_TERMS) and priority["score"] < 130:
-        return True
-    return False
-
-
-def _v15_is_reportable_regulation(row):
-    if _v16_is_admin_noise(row):
-        return False
-    return _v16_priority(row)["score"] >= 95
-
-
-def to_output(df, content_type="Regulation"):
-    if content_type != "Regulation":
-        return _v16_to_output_base(df, content_type)
-    rows = []
-    if df is None:
-        df = pd.DataFrame()
-    for _, r in df.reset_index(drop=True).iterrows():
-        priority = _v16_priority(r)
-        issue = priority["issue"]
-        impact = priority["impact"]
-        score = max(int(float(r.get("score", 0) or 0)), int(priority["score"])) if issue != "Reference" else int(float(r.get("score", 0) or 0))
-        title = _v16_title(r)
-        pub_date = _v12_publish_date(r)
-        rows.append({
-            "No": len(rows) + 1, "Content Type": content_type, "Mail Group": "Regulation", "Samsung Impact": impact,
-            "Affected Subsidiary": _v16u(r"\ud55c\uad6d/\uc8fc\uc694 \uc0dd\uc0b0\ubc95\uc778 \ubc0f \uad00\ub828 \uc218\uc785\u00b7\uc218\ucd9c \ubc95\uc778"),
-            "Impact Reason": "v16c_original_field_priority:" + ",".join(priority.get("terms", [])[:5]),
-            "Date": pub_date, "Publish Date": pub_date, "Headline": title, "Summary": _v16_summary(r, issue),
-            "AI Analysis": _v16u(r"\uc0bc\uc131\uc804\uc790 \uad00\uc138 \ub2f4\ub2f9 \uad00\uc810\uc5d0\uc11c \uc218\uc785\ud1b5\uad00, FTA\u00b7\uc6d0\uc0b0\uc9c0, HS/\ud488\ubaa9\ubd84\ub958, \uad00\uc138\ube44\uc6a9 \ub610\ub294 \uc218\ucd9c\ud1b5\uc81c \uc808\ucc28\uc5d0 \uc601\ud5a5\uc744 \uc904 \uc218 \uc788\ub294 \uacf5\uc2dd \ubc95\uaddc\uc785\ub2c8\ub2e4. \uc6d0\ubb38 \uae30\uc900 \uc801\uc6a9 \ud488\ubaa9\u00b7HS\u00b7\uc138\uc728\u00b7\uc2dc\ud589\uc77c\u00b7\uc99d\ube59\uc694\uac74\uc744 \ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \ub300\uc870\ud574\uc57c \ud569\ub2c8\ub2e4."),
-            "Action Plan": _v16_action(r, issue), "Country": _v16_country(r), "Agency": _v16_text(r.get("Agency", r.get("agency", ""))),
-            "Risk": _v16_risk(issue, impact, score), "Importance Score": score,
-            "Priority Group": "CORE" if score >= 110 else ("USABLE" if impact != "Reference" else "REFERENCE"),
-            "Issue": issue, "Cluster": title, "URL": _v13_fix_unipass_url(r), "Source": _v16_text(r.get("Source", r.get("source", ""))),
-            "Source File": "3-1.regulation_article_summary.xlsx", "RejectReason": _v16_text(r.get("RejectReason", "")),
-            "KeywordMatches": ",".join(priority.get("terms", [])) or _v16_text(r.get("KeywordMatches", "")),
-            "effective_date_hint": _v16_text(r.get("effective_date_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
-            "hs_hint": _v16_text(r.get("hs_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
-            "tariff_rate_hint": _v16_text(r.get("tariff_rate_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
-            "article_extract_status": _v16_text(r.get("article_extract_status", "")), "ExecutiveMessage": _v16_summary(r, issue)[:500],
-        })
-    return pd.DataFrame(rows, columns=OUTPUT_COLS)
-
-# ======================================================================
-# End of GTI STEP4-1 v16c
-# ======================================================================
-
-
-# ======================================================================
-# GTI STEP4-1 v16d: reduce false positives from clhs URL and generic import
-# requirement laws. Generic "?????/????" is review material unless the
-# title also contains Samsung customs core terms.
-# ======================================================================
-
-def _v16_match_blob(row) -> str:
-    cols = ["Headline", "Title", "title", "headline", "article_body", "regulation_fallback_body", "effective_date_hint", "hs_hint", "tariff_rate_hint", "matched_policy_terms"]
-    return " ".join(_v16_text(row.get(c, "")) for c in cols).lower()
-
-
-def _v16_matches(blob: str, terms) -> list[str]:
-    found = []
-    for t in terms:
-        tt = str(t)
-        if tt == "HS":
-            if re.search(r"(?<![A-Za-z])hs(?![A-Za-z])", blob, flags=re.I):
-                found.append(t)
-            continue
-        if tt.lower() in blob:
-            found.append(t)
-    return found
-
-
-def _v16_priority(row) -> dict:
-    match_blob = _v16_match_blob(row)
-    official_blob = _v16_source_blob(row)
-    title_l = _v16_title(row).lower()
-    best = {"issue": "Reference", "impact": "Reference", "score": 0, "terms": []}
-    for issue, impact, base_score, terms in V16_CRITICAL_RULES:
-        found = _v16_matches(match_blob, terms)
-        if not found:
-            continue
-        # Generic import-requirement terms alone are not enough for executive report.
-        if set(found) <= {_v16u(r"\uc138\uad00\uc7a5\ud655\uc778"), _v16u(r"\ud1b5\ud569\uacf5\uace0"), _v16u(r"\ubcf4\uc138")}:
-            title_core = any(x in title_l for x in [_v16u(r"\ud560\ub2f9\uad00\uc138"), _v16u(r"\uc6d0\uc0b0\uc9c0"), "fta", _v16u(r"\uad00\uc138\uc728"), _v16u(r"\uc218\ucd9c\ud1b5\uc81c"), _v16u(r"\ud488\ubaa9\ubd84\ub958")])
-            if not title_core:
-                continue
-        title_bonus = 18 if _v16_matches(title_l, terms) else 0
-        official_bonus = 8 if any(x.lower() in official_blob for x in V16_OFFICIAL_SOURCE_HINTS) else 0
-        score = base_score + min(len(found), 4) * 4 + title_bonus + official_bonus
-        if score > best["score"]:
-            best = {"issue": issue, "impact": impact, "score": score, "terms": found}
-    return best
-
-
-def _v16_is_admin_noise(row) -> bool:
-    title = _v16_title(row).lower()
-    critical_title_terms = [_v16u(r"\ud560\ub2f9\uad00\uc138"), _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870"), _v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "fta", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0"), _v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9"), _v16u(r"\uc218\ucd9c\ud1b5\uc81c"), _v16u(r"\ud488\ubaa9\ubd84\ub958")]
-    if any(t.lower() in title for t in V16_ADMIN_NOISE_TERMS) and not any(t.lower() in title for t in critical_title_terms):
-        return True
-    if any(t.lower() in title for t in V16_NON_TRADE_LAW_TERMS):
-        return True
-    priority = _v16_priority(row)
-    if priority["score"] >= 115:
-        return False
-    return False
-
-# ======================================================================
-# End of GTI STEP4-1 v16d
-# ======================================================================
-
-
-# ======================================================================
-# GTI STEP4-1 v16e: deduplicate the same regulation from multiple official
-# mirrors (UNIPASS/law.go.kr/clhs) before writing daily summary.
-# ======================================================================
-
-def _v16_reg_dedup_key(row) -> str:
-    title = _v16_title(row)
-    title = re.sub(r"\([^)]*\)", " ", title)
-    title = re.sub(r"\[[^]]*\]", " ", title)
-    title = re.sub(r"[^\w]+", "", title, flags=re.UNICODE).replace("_", "").lower()
-    title = re.sub(r"20\d{2}\d*", "", title)
-    title = title.replace(_v16u(r"\uc81c"), "").replace(_v16u(r"\ud638"), "")
-    for suffix in [_v16u(r"\uad00\uc138\uccad\uace0\uc2dc"), _v16u(r"\uace0\uc2dc")]:
-        title = title.replace(suffix, "")
-    return title[:90] or _v16_text(row.get("URL", ""))[:160]
-
-_v16e_split_base = _v15_split_reg_daily
-
-def _v15_split_reg_daily(daily):
-    kept, removed = _v16e_split_base(daily)
-    if kept is None or kept.empty:
-        return kept, removed
-    kept = kept.copy()
-    kept["_v16_dedup_key"] = kept.apply(_v16_reg_dedup_key, axis=1)
-    kept["_v16_source_rank"] = kept["URL"].astype(str).str.contains("law.go.kr", case=False, na=False).astype(int) * 2 + kept["URL"].astype(str).str.contains("unipass.customs.go.kr", case=False, na=False).astype(int)
-    kept = kept.sort_values(["Importance Score", "_v16_source_rank"], ascending=[False, False])
-    dup_mask = kept.duplicated("_v16_dedup_key", keep="first")
-    dups = kept.loc[dup_mask].copy()
-    kept = kept.loc[~dup_mask].copy()
-    if not dups.empty:
-        dups["RejectReason"] = dups.get("RejectReason", "").fillna("").astype(str).apply(lambda v: (v + "; " if v else "") + "v16_duplicate_same_regulation")
-        removed = pd.concat([removed, dups.drop(columns=["_v16_dedup_key", "_v16_source_rank"], errors="ignore")], ignore_index=True, sort=False) if removed is not None else dups
-    kept = kept.drop(columns=["_v16_dedup_key", "_v16_source_rank"], errors="ignore").reset_index(drop=True)
-    if "No" in kept.columns:
-        kept["No"] = range(1, len(kept) + 1)
-    return kept, removed
-
-# ======================================================================
-# End of GTI STEP4-1 v16e
-# ======================================================================
-
 def main():
-    print("[STEP4-1] Regulation analysis start - GUARDRAIL v4.1")
+    print("GTI STEP4-1 REGULATION AI v8.8 KST PRIOR-DAY START")
+    print(f"[MODEL] {GEMINI_MODEL}")
     _gti_step4_gemini_log_once()
-    _gti_step4_v10_log_once()
-    log(f"Gemini model candidates: {GEMINI_MODEL_CANDIDATES}")
     _gti_step4_extractor_log_once()
     global KEYWORD_TERMS
     KEYWORD_TERMS = load_keyword_terms()
     log(f"keyword guardrail loaded: {len(KEYWORD_TERMS)} terms")
     df=read_input()
+    df, stale_input = strict_24h(df)
     selected, excluded_raw, audit_raw=build(df)
-    raw_daily=to_output(selected)
-    daily, removed_daily = _v15_split_reg_daily(raw_daily)
+    practical_watch_pattern = re.compile(
+        r"수입\s*기계(?:류)?|부분품|부속품|규격\s*확인|위탁가공|관세\s*환급|"
+        r"품목분류|검사\s*예규|납세신고\s*정정|전자문서\s*변경|5FE|5FK",
+        re.I,
+    )
+    if not selected.empty:
+        selected["CustomsOperationalWatchFlag"] = selected.apply(
+            lambda r: "Y" if practical_watch_pattern.search(
+                " ".join(clean(r.get(c, "")) for c in ["Headline", "Summary", "Evidence"])
+            ) else "N",
+            axis=1,
+        )
+    daily=to_output(selected)
     excluded=to_output(excluded_raw)
-    if removed_daily is not None and not removed_daily.empty:
-        excluded = pd.concat([excluded, removed_daily], ignore_index=True, sort=False)
+    if not stale_input.empty:
+        stale_rows = stale_input.copy()
+        stale_rows["selected"] = False
+        stale_rows["score"] = 0
+        stale_rows["Risk"] = "하"
+        stale_rows["Issue"] = ""
+        stale_rows["topic"] = ""
+        stale_rows["RejectReason"] = "STRICT_24H_PUBLISHED_DATE"
+        stale_rows["Summary"] = stale_rows.get("Summary", "")
+        stale_rows["AI Analysis"] = stale_rows.get("AI Analysis", "")
+        stale_rows["Action Plan"] = stale_rows.get("Action Plan", "")
+        stale_rows["Samsung Impact"] = "Reference"
+        stale_rows["Top3 Eligible"] = "N"
+        stale_rows["PriorityEligible"] = "N"
+        stale_rows["DecisionStatus"] = "Excluded - older than 24 hours"
+        stale_rows["Policy Stage"] = ""
+        stale_rows["Body Verified"] = "N"
+        stale_rows["Change Type"] = ""
+        stale_rows["Evidence"] = ""
+        stale_rows["Missing Facts"] = ""
+        excluded = pd.concat([excluded, to_output(stale_rows)], ignore_index=True, sort=False)
     cumulative=merge_cumulative(daily)
     write_excel(daily, OUT_SUMMARY); write_excel(cumulative, OUT_CUMULATIVE); write_excel(excluded, OUT_EXCLUDED)
+    if not CUMULATIVE_REMOVED_DF.empty:
+        write_excel(CUMULATIVE_REMOVED_DF, OUT_CUMULATIVE_REMOVED)
     print(f"[DONE] Daily: {OUT_SUMMARY}")
     print(f"[DONE] Cumulative: {OUT_CUMULATIVE}")
     print(f"[DONE] Excluded: {OUT_EXCLUDED}")

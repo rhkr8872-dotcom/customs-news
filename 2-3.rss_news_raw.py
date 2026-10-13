@@ -1,6 +1,5 @@
-﻿# GTI FINAL CORE v6 - RSS/Site News with Selenium Google URL recovery
-# =========================================================
-# GTI STEP2-3 - RSS NEWS RAW MASTER VERSION v3.4
+﻿# =========================================================
+# GTI STEP2-3 - RSS NEWS RAW MASTER VERSION v3.3
 # Purpose
 # - Read RSS feeds from C:/Temp/gti_master.xlsx first, then sites.xlsx fallback
 # - Scan all sheets, not only Sheet1/site_rss
@@ -11,7 +10,6 @@
 
 import os
 import re
-import socket
 import warnings
 import importlib.util
 from datetime import datetime, timedelta
@@ -23,7 +21,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser
 
-print("GTI STEP2-3 RSS/SITE NEWS-ONLY START v3.4 MASTER")
+print("🚀 GTI v5.0 STEP2-3 RSS + SITE NEWS BROAD COLLECTION START")
 
 # ===================== CONFIG =====================
 BASE_DIR = os.getenv("GTI_BASE_DIR", r"C:/Temp")
@@ -31,25 +29,22 @@ OUTPUT_FILE = os.getenv("GTI_RSS_OUTPUT_FILE", os.path.join(BASE_DIR, "2-3.rss_n
 MASTER_FILE = os.getenv("GTI_MASTER_FILE", os.path.join(BASE_DIR, "gti_master.xlsx"))
 SITES_FILE_FALLBACK = os.getenv("GTI_SITES_FILE", os.path.join(BASE_DIR, "sites.xlsx"))
 SITE_CRAWLER_FILE = os.getenv("GTI_SITE_CRAWLER_FILE", os.path.join(BASE_DIR, "1.site_crawler.py"))
-STEP1_SITE_NEWS_FILE = os.getenv("GTI_STEP1_SITE_NEWS_FILE", os.path.join(BASE_DIR, "1-2.site_news_raw.xlsx"))
 os.makedirs(BASE_DIR, exist_ok=True)
 
-LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "72"))
+LOOKBACK_HOURS = int(os.getenv("GTI_STEP2_NEWS_LOOKBACK_HOURS", "72"))
 CUT_OFF = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
 MAX_FEEDS_TO_READ = int(os.getenv("GTI_RSS_MAX_FEEDS", "500"))
 MAX_ITEMS_PER_FEED = int(os.getenv("GTI_RSS_MAX_ITEMS_PER_FEED", "300"))
-RSS_FETCH_TIMEOUT = int(os.getenv("GTI_RSS_FETCH_TIMEOUT", "15"))
-socket.setdefaulttimeout(RSS_FETCH_TIMEOUT)
 
 # If master reading fails or has too few RSS feeds, optional hard safety fallback.
 # Keep N by default because GTI master should be the source of truth.
 ENABLE_LEGACY_GOOGLE_ALERT_FALLBACK = os.getenv("GTI_RSS_LEGACY_FALLBACK", "N").strip().upper() == "Y"
 
 FINAL_COLS = [
-    "date", "title", "headline", "url", "source", "feed_name",
+    "date", "title", "url", "source", "feed_name",
     "summary", "collected_at",
     "keyword", "category", "importance", "importance_score",
-    "score_reason", "url_type", "canonical_url", "url_decode_status",
+    "score_reason", "url_type", "canonical_url",
     "source_channel", "agency", "site_type"
 ]
 
@@ -372,7 +367,7 @@ except Exception as e:
 
 
 def collect_site_news():
-    """Collect non-RSS site news using the existing STEP1 site crawler functions."""
+    """Collect non-RSS news-site posts here; STEP1 is regulation-only."""
     site_rows = load_site_news_rows_from_master()
     if not site_rows:
         return pd.DataFrame(columns=FINAL_COLS)
@@ -463,13 +458,9 @@ def collect_site_news():
     rows["score_reason"] = "site_news"
     rows["url_type"] = rows["url"].apply(detect_url_type)
     rows["canonical_url"] = rows["url"].apply(canonicalize_url)
-    rows["url_decode_status"] = rows["url"].apply(lambda u: "GOOGLE_REMAINED" if is_google_intermediate_url(u) else "RESOLVED_DIRECT")
     rows["source_channel"] = "site_news"
     rows["agency"] = raw.get("agency", "")
     rows["site_type"] = "news"
-    for col in FINAL_COLS:
-        if col not in rows.columns:
-            rows[col] = ""
     return rows[FINAL_COLS]
 
 # ===================== UTILS =====================
@@ -581,78 +572,6 @@ def decode_google_redirect(url):
     return normalize_url(url)
 
 
-
-# ======================================================================
-# GTI FINAL CORE v5 - Selenium Google URL recovery
-# 브라우저에서 Google News/Alert 링크를 누르면 원문이 열리는 케이스를
-# headless Chrome으로 실제 열어 driver.current_url을 확보한다.
-# ======================================================================
-SELENIUM_GOOGLE_RESOLVE_ENABLED = os.getenv("GTI_SELENIUM_GOOGLE_RESOLVE", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
-SELENIUM_GOOGLE_TIMEOUT = int(os.getenv("GTI_SELENIUM_GOOGLE_TIMEOUT", "20"))
-
-
-def is_google_intermediate_url(value):
-    u = str(value or "").lower().strip()
-    return (
-        "news.google.com" in u
-        or "google.co.kr/alerts/feeds" in u
-        or "google.com/alerts/feeds" in u
-        or "google.co.kr/url?" in u
-        or "google.com/url?" in u
-    )
-
-
-def resolve_google_url_by_selenium(url, timeout=None):
-    """Return (resolved_url, status). Uses headless Chrome as final fallback."""
-    u = str(url or "").strip()
-    if not u:
-        return "", "EMPTY_URL"
-    if not is_google_intermediate_url(u):
-        return u, "NOT_GOOGLE_URL"
-    if not SELENIUM_GOOGLE_RESOLVE_ENABLED:
-        return u, "SELENIUM_DISABLED"
-    timeout = int(timeout or SELENIUM_GOOGLE_TIMEOUT)
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.support.ui import WebDriverWait
-
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1365,900")
-        options.add_argument("--lang=ko-KR")
-        options.add_argument(
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        )
-
-        driver = webdriver.Chrome(options=options)
-        try:
-            driver.set_page_load_timeout(timeout)
-            driver.get(u)
-
-            def moved_away_from_google(d):
-                cur = (d.current_url or "").lower()
-                return bool(cur) and not is_google_intermediate_url(cur)
-
-            try:
-                WebDriverWait(driver, timeout).until(moved_away_from_google)
-            except Exception:
-                pass
-            final_url = (driver.current_url or "").strip()
-        finally:
-            driver.quit()
-
-        if final_url and not is_google_intermediate_url(final_url):
-            return final_url, "RESOLVED_SELENIUM"
-        return final_url or u, "GOOGLE_REMAINED"
-    except Exception as exc:
-        return u, f"SELENIUM_FAILED:{type(exc).__name__}"
-
-
 def extract_title(entry):
     return clean_html(entry.get("title", ""))
 
@@ -685,19 +604,6 @@ def extract_url(entry):
         except Exception:
             pass
     return decode_google_redirect(link)
-
-
-
-def extract_url_with_status(entry):
-    raw = extract_url(entry)
-    if not raw:
-        return "", "EMPTY_URL"
-    if is_google_intermediate_url(raw):
-        resolved, status = resolve_google_url_by_selenium(raw, timeout=SELENIUM_GOOGLE_TIMEOUT)
-        if resolved and not is_google_intermediate_url(resolved):
-            return normalize_url(resolved), status
-        return normalize_url(raw), status or "GOOGLE_REMAINED"
-    return normalize_url(raw), "RESOLVED_DIRECT"
 
 # ===================== SCORE CONTROL =====================
 
@@ -743,137 +649,6 @@ def adjust_importance_score(keyword, title, summary, url, base_score):
 
     return max(0, min(score, 150)), ", ".join(reasons) or "base", url_type
 
-
-# ===================== STEP2-3 FINAL NEWS QUALITY GATE =====================
-
-TRADE_NEWS_CONTEXT_TERMS = [
-    "customs", "tariff", "duty", "duties", "trade", "import", "export", "origin",
-    "fta", "cepa", "epa", "hs code", "classification", "valuation", "drawback",
-    "anti-dumping", "antidumping", "countervailing", "safeguard", "section 301",
-    "section 232", "export control", "entity list", "uflpa", "forced labor",
-    "cbam", "carbon border", "quota", "sanction",
-    "\uad00\uc138", "\ud1b5\uad00", "\ud1b5\uc0c1", "\ubb34\uc5ed", "\uc218\uc785", "\uc218\ucd9c",
-    "\uc6d0\uc0b0\uc9c0", "\ud488\ubaa9\ubd84\ub958", "\uc138\uc728", "\ud658\uae09", "\ubcf4\uc138",
-    "\ubc18\ub364\ud551", "\uc0c1\uacc4\uad00\uc138", "\ub364\ud551\ubc29\uc9c0\uad00\uc138",
-    "\uc218\ucd9c\ud1b5\uc81c", "\uac15\uc81c\ub178\ub3d9", "\ud560\ub2f9\uad00\uc138",
-]
-
-NEWS_NOISE_TERMS = [
-    "stock price", "shares", "share price", "market cap", "crypto", "bitcoin",
-    "coin", "earnings preview", "earnings outlook", "investment recommendation",
-    "youtube", "vod", "video", "shorts", "podcast",
-    "\uc8fc\uac00", "\uc2dc\ucd1d", "\ucf54\uc778", "\ube44\ud2b8\ucf54\uc778", "\uc554\ud638\ud654\ud3d0",
-    "\uc99d\uad8c", "\ud22c\uc790\uc758\uacac", "\ubaa9\ud45c\uc8fc\uac00", "\uc2e4\uc801 \uc804\ub9dd",
-    "\uc601\uc0c1", "\uc720\ud29c\ube0c", "\uc1fc\uce20",
-]
-
-NEWS_FORCE_KEEP_TERMS = [
-    "tariff", "customs", "anti-dumping", "countervailing", "export control",
-    "section 301", "section 232", "fta", "cbam",
-    "\uad00\uc138", "\ud1b5\uad00", "\ubc18\ub364\ud551", "\uc0c1\uacc4\uad00\uc138",
-    "\uc218\ucd9c\ud1b5\uc81c", "\uc6d0\uc0b0\uc9c0", "\ud488\ubaa9\ubd84\ub958",
-]
-
-
-def _news_text(row):
-    return " ".join(
-        _clean_value(row.get(c, ""))
-        for c in ["title", "headline", "summary", "keyword", "category", "feed_name", "agency", "source"]
-    ).lower()
-
-
-def has_trade_news_context(row):
-    return any(term.lower() in _news_text(row) for term in TRADE_NEWS_CONTEXT_TERMS)
-
-
-def is_news_noise(row):
-    text = _news_text(row)
-    title = _clean_value(row.get("title", "") or row.get("headline", "")).lower()
-    title_noise = any(term.lower() in title for term in NEWS_NOISE_TERMS)
-    title_force = any(term.lower() in title for term in NEWS_FORCE_KEEP_TERMS)
-    if title_noise and not title_force:
-        return True
-    if _clean_value(row.get("url_type", "")).lower() == "youtube" and not title_force:
-        return True
-    if not any(term.lower() in text for term in NEWS_NOISE_TERMS):
-        return False
-    return not any(term.lower() in text for term in NEWS_FORCE_KEEP_TERMS)
-
-
-def require_headline_url(df, context):
-    if df is None or df.empty:
-        return df.copy() if df is not None else pd.DataFrame(columns=FINAL_COLS)
-    work = df.copy()
-    if "headline" not in work.columns:
-        work["headline"] = work.get("title", "")
-    else:
-        blank = work["headline"].fillna("").astype(str).str.strip().eq("")
-        if "title" in work.columns:
-            work.loc[blank, "headline"] = work.loc[blank, "title"]
-    mask = (
-        work["title"].fillna("").astype(str).str.strip().ne("")
-        & work["url"].fillna("").astype(str).str.startswith("http")
-    )
-    removed = int((~mask).sum())
-    if removed:
-        print(f"QUALITY {context}: removed without title/url = {removed}")
-    return work[mask].copy()
-
-
-def filter_trade_news(df, context):
-    if df is None or df.empty:
-        return df.copy() if df is not None else pd.DataFrame(columns=FINAL_COLS)
-    work = require_headline_url(df, context)
-    before = len(work)
-    context_mask = work.apply(has_trade_news_context, axis=1)
-    noise_mask = work.apply(is_news_noise, axis=1)
-    out = work[context_mask & ~noise_mask].copy()
-    print(
-        f"QUALITY {context}: trade_context {before}->{int(context_mask.sum())}, "
-        f"noise_removed={int((context_mask & noise_mask).sum())}, kept={len(out)}"
-    )
-    return out
-
-
-def load_step1_site_news_compat():
-    """Import 1-2.site_news_raw.xlsx into STEP2-3 as compatibility site-news input."""
-    if not os.path.exists(STEP1_SITE_NEWS_FILE):
-        return pd.DataFrame(columns=FINAL_COLS)
-    try:
-        raw = pd.read_excel(STEP1_SITE_NEWS_FILE)
-    except Exception as exc:
-        print(f"STEP1 site-news compat read failed: {STEP1_SITE_NEWS_FILE} / {type(exc).__name__}: {exc}")
-        return pd.DataFrame(columns=FINAL_COLS)
-    if raw.empty:
-        return pd.DataFrame(columns=FINAL_COLS)
-    out = pd.DataFrame()
-    out["date"] = raw.get("date", "")
-    out["title"] = raw.get("headline", raw.get("title", ""))
-    out["headline"] = out["title"]
-    out["url"] = raw.get("url", "")
-    out["source"] = raw.get("source", "")
-    out["feed_name"] = raw.get("agency", "STEP1 site news")
-    out["summary"] = raw.get("regulation_fallback_body", raw.get("summary", ""))
-    out["collected_at"] = raw.get("collected_at", datetime.now().replace(microsecond=0))
-    out["keyword"] = raw.get("matched_policy_terms", raw.get("keyword", ""))
-    out["category"] = "STEP1_SITE_NEWS"
-    out["importance"] = "MEDIUM"
-    out["importance_score"] = pd.to_numeric(raw.get("policy_score", 70), errors="coerce").fillna(70).clip(0, 150)
-    out["score_reason"] = raw.get("law1_news_reason", "step1_site_news_compat")
-    out["url_type"] = out["url"].apply(detect_url_type)
-    out["canonical_url"] = out["url"].apply(canonicalize_url)
-    out["url_decode_status"] = out["url"].apply(lambda u: "GOOGLE_REMAINED" if is_google_intermediate_url(u) else "RESOLVED_DIRECT")
-    out["source_channel"] = "step1_site_news"
-    out["agency"] = raw.get("agency", "")
-    out["site_type"] = "news"
-    for col in FINAL_COLS:
-        if col not in out.columns:
-            out[col] = ""
-    out = out[FINAL_COLS]
-    out = filter_trade_news(out, "step1_site_news_compat")
-    print(f"STEP1 site-news compat loaded: {len(out)} / source={STEP1_SITE_NEWS_FILE}")
-    return out
-
 # ===================== COLLECT =====================
 
 def _entry_date(entry):
@@ -902,14 +677,10 @@ def collect():
         exclude_keywords = feed_info.get("exclude_keywords", "")
 
         print("FETCH:", feed_name, "|", feed_url)
-        try:
-            feed = feedparser.parse(feed_url)
-        except Exception as exc:
-            print(f"   [RSS SKIP] fetch/parse failed: {type(exc).__name__}: {exc}")
-            continue
+        feed = feedparser.parse(feed_url)
         if getattr(feed, "bozo", False):
             # Keep going; many feeds are bozo but still usable.
-            print(f"   [RSS WARN] feed parse warning: {type(getattr(feed, 'bozo_exception', None)).__name__}")
+            print(f"   ?좑툘 feed parse warning: {type(getattr(feed, 'bozo_exception', None)).__name__}")
 
         for e in (feed.entries or [])[:MAX_ITEMS_PER_FEED]:
             title = extract_title(e)
@@ -927,7 +698,7 @@ def collect():
             if exclude_keywords and contains_any(f"{title} {summary}", exclude_keywords):
                 continue
 
-            url, url_decode_status = extract_url_with_status(e)
+            url = extract_url(e)
             base_score = feed_info.get("importance_score", 50)
             importance_score, score_reason, url_type = adjust_importance_score(
                 feed_info.get("keyword", ""), title, summary, url, base_score
@@ -949,7 +720,6 @@ def collect():
                 "score_reason": score_reason,
                 "url_type": url_type,
                 "canonical_url": canonical_url,
-                "url_decode_status": url_decode_status,
                 "source_channel": "rss",
                 "agency": feed_name,
                 "site_type": "news",
@@ -983,15 +753,10 @@ def dedup(df):
 # ===================== MAIN =====================
 
 def main():
-    print(f"LOOKBACK_HOURS={LOOKBACK_HOURS}")
     site_df = collect_site_news()
-    step1_site_df = load_step1_site_news_compat()
     rss_df = collect()
-    site_df = filter_trade_news(site_df, "site_news")
-    rss_df = filter_trade_news(rss_df, "rss")
-    df = pd.concat([site_df, step1_site_df, rss_df], ignore_index=True, sort=False)
+    df = pd.concat([site_df, rss_df], ignore_index=True, sort=False)
     print("Collected site_news:", len(site_df))
-    print("Collected step1_site_news:", len(step1_site_df))
     print("Collected rss:", len(rss_df))
     print("Collected total:", len(df))
 
@@ -1004,7 +769,6 @@ def main():
 
     df = dedup(df)
     df = df.sort_values(["importance_score", "date"], ascending=[False, False]).head(300)
-    df = require_headline_url(df, "final_output")
     for col in FINAL_COLS:
         if col not in df.columns:
             df[col] = ""
@@ -1017,4 +781,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,23 +1,55 @@
-﻿
-# 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
-# GTI FINAL CORE v6 - Full pipeline
 """
-GTI LAW1/NEWSREST split pipeline.
+GTI PIPELINE v45 - QUALITY CONTRACT + FAIL-SAFE LIVE WATCHDOG
+====================================================
 
-Flow:
-1. Site crawler creates 1-1 official regulation only; non-LAW1 rows become news/reference candidates.
-2. Naver, Google, RSS collectors create external news raw files.
-3. Separate merge jobs build regulation and news summaries.
-4. Separate AI analysis job
+REGULATION BRANCH
+    1.site_crawler.py
+        -> 1-1.regulation_raw.xlsx
+    3-1.regulation_merge.py
+        -> 3-1.regulation_summary.xlsx
+        -> 3-1.regulation_article_summary.xlsx
+        -> 3-1.regulation_cumulative.xlsx
+    4-1.regulation_ai_analysis.py
+        -> 4-1.regulation_ai_summary.xlsx
+        -> 4-1.regulation_ai_cumulative.xlsx
 
-s build regulation and news analysis files.
-5. A combined mail input is generated and passed to the mail engine.
+NEWS BRANCH
+    2-1.NAVER_news_collector.py
+    2-2.google_news_collector.py
+    2-3.rss_news_raw.py
+        -> news raw files
+    3-2.news_merge.py
+        -> 3-2.news_summary.xlsx
+        -> 3-2.news_cumulative.xlsx
+    4-2.news_ai_analysis.py
+        -> 4-2.news_ai_summary.xlsx
+        -> 4-2.news_ai_cumulative.xlsx
+
+FINAL MAIL
+    4-1.regulation_ai_summary.xlsx
+        +
+    4-2.news_ai_summary.xlsx
+        -> 5.GTI_Mail_Engine.py
+        -> GTI Radar HTML / XLSX
+
+Critical rules
+--------------
+1. Regulation and News never depend on each other before Step5.
+2. 3-1 never creates/checks news files.
+3. 3-2 never creates/checks regulation files.
+4. 4-1 reads regulation output only.
+5. 4-2 reads news output only.
+6. Step5 may report either successful branch; a failed branch is never reused.
+7. A valid zero-row AI result is accepted as a successful current-run result.
+8. Child logs are unbuffered and a no-progress watchdog prevents silent hangs.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
+import json
 import os
 import queue
 import shutil
@@ -33,41 +65,52 @@ import pandas as pd
 
 
 BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
-PYTHON_EXE = Path(os.getenv("GTI_PYTHON_EXE", r"C:\Users\KCH\AppData\Local\Programs\Python\Python312\python.exe"))
+PYTHON_EXE = Path(
+    os.getenv(
+        "GTI_PYTHON_EXE",
+        r"C:\Users\KCH\AppData\Local\Programs\Python\Python312\python.exe",
+    )
+)
 
 LOG_DIR = BASE_DIR / "logs"
 ARCHIVE_DIR = BASE_DIR / "archive"
-LOG_FILE = LOG_DIR / "gti_pipeline_run.log"
+LOG_FILE = LOG_DIR / "gti_pipeline_v43_split.log"
 
-MAIL_INPUT_FILE = BASE_DIR / "4.gti_mail_input.xlsx"
 MAIL_OUTPUT_DIR = BASE_DIR / "12345" / "c_type_outputs"
+PIPELINE_STATUS_FILE = BASE_DIR / "gti_pipeline_status.json"
 
-# Pipeline-level defaults. Individual scripts still allow explicit environment overrides.
+
 PIPELINE_ENV_DEFAULTS = {
-    # Core rule: daily news and normal regulation sensing are based on the latest 24 hours.
-    # Official regulation protection/review logic remains inside Step1/Step4 so important law items are not lost.
-    "GTI_STEP1_HOURS_BACK": "24",
-    "GTI_LOOKBACK_HOURS": "24",
+    # Regulation collection can be wider; new-event control is handled by 3-1.
+    "GTI_STEP1_HOURS_BACK": "72",
+
+    # News: broad collection -> strict recent report candidates.
+    "GTI_LOOKBACK_HOURS": "72",
     "GTI_STEP3_RECENT_HOURS": "24",
     "GTI_STEP4_NEWS_MAX_AGE_HOURS": "24",
-    "GTI_MAIL_MAX_AGE_DAYS": "45",
-    "GTI_MAIL_MAX_AGE_DAYS_REG": "45",
-    "GTI_MAIL_MAX_AGE_DAYS_NEWS": "1",
+    "GTI_STEP4_REG_MAX_AGE_HOURS": "24",
+
+    # Step5 final hard guard.
+    "GTI_MAIL_NEWS_HOURS": "24",
+
+    # Gemini.
     "GTI_GEMINI_MODEL": "gemini-2.5-flash-lite",
     "GTI_GEMINI_TIMEOUT": "20",
+
+    # Network.
     "GTI_ARTICLE_FETCH_TIMEOUT": "12",
     "GTI_RSS_FETCH_TIMEOUT": "15",
-    # News must be Samsung customs-impact Top 30, with customs/trade signal in the original title.
+
+    # News output.
+    "GTI_STEP3_TARGET_MAX": "300",
     "GTI_STEP4_NEWS_TARGET_MAX": "30",
     "GTI_STRICT_NEWS_TARGET_MAX": "30",
-    "GTI_STRICT_FINAL_ENABLED": "1",
-    "GTI_NEWS_TITLE_KEYWORD_REQUIRED": "Y",
-    # Keep original URL/title accuracy high; Google broad collection defers final URL checks to Step3/Step4.
+
+    # URL.
     "GTI_STEP2_RESOLVE_ORIGINAL_URL": "N",
-    "GTI_STEP2_URL_RESOLVE_LIMIT": "0",
-    "GTI_ORIGINAL_URL_SEARCH_ENABLED": "1",
-    "GTI_SELENIUM_GOOGLE_RESOLVE": "1",
-    "GTI_SELENIUM_GOOGLE_TIMEOUT": "20",
+    # Direct Google redirect resolution repeatedly returned 0/120. STEP4
+    # performs the authoritative body extraction, so avoid the daily delay.
+    "GTI_STEP3_RESOLVE_URL": "N",
 }
 
 
@@ -77,111 +120,147 @@ class Step:
     script: str
     required: bool = True
     expected_outputs: tuple[str, ...] = field(default_factory=tuple)
+    min_rows: dict[str, int] = field(default_factory=dict)
     args: tuple[str, ...] = field(default_factory=tuple)
     timeout_sec: int | None = None
+    idle_timeout_sec: int | None = None
 
 
-STAGE_1 = [
+# =============================================================================
+# REGULATION BRANCH
+# =============================================================================
+
+REGULATION_STEPS = [
     Step(
-        "STEP1_SITE_CRAWLER",
-        "1.site_crawler.py",
-        required=True,
+        name="REG_1_CRAWL",
+        script="1.site_crawler.py",
         expected_outputs=("1-1.regulation_raw.xlsx",),
         timeout_sec=1800,
     ),
-]
-
-STAGE_2 = [
-    Step("STEP2_NAVER", "2-1.NAVER_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",), timeout_sec=900),
-    Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",), timeout_sec=1200),
-    Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",), timeout_sec=900),
-]
-
-STAGE_3 = [
     Step(
-        "STEP3_2_NEWS_MERGE",
-        "3-2.news_merge.py",
-        required=True,
-        expected_outputs=("3-2.news_summary.xlsx", "3-2.news_cumulative.xlsx"),
-        timeout_sec=1800,
-    ),
-]
-
-STAGE_3_ARTICLE = [
-    Step(
-        "STEP3_ARTICLE_SUMMARY",
-        "3-1.regulation_merge.py",
-        required=True,
+        name="REG_3_1_SELECT",
+        script="3-1.regulation_merge.py",
         expected_outputs=(
+            "3-1.regulation_summary.xlsx",
             "3-1.regulation_article_summary.xlsx",
-            "3-2.news_article_summary.xlsx",
-            "3-2.news_article_cluster_audit.xlsx",
+            "3-1.regulation_cumulative.xlsx",
         ),
-        timeout_sec=14400,
+        timeout_sec=3600,
+    ),
+    Step(
+        name="REG_4_1_AI",
+        script="4-1.regulation_ai_analysis.py",
+        expected_outputs=(
+            "4-1.regulation_ai_summary.xlsx",
+            "4-1.regulation_ai_cumulative.xlsx",
+        ),
+        timeout_sec=3600,
     ),
 ]
 
-STAGE_4 = [
-    Step(
-        "STEP4_1_REGULATION_AI",
-        "4-1.regulation_ai_analysis.py",
-        required=True,
-        expected_outputs=("4-1.regulation_ai_summary.xlsx", "4-1.regulation_ai_cumulative.xlsx"),
-        timeout_sec=1800,
-    ),
-    Step(
-        "STEP4_2_NEWS_AI",
-        "4-2.news_ai_analysis.py",
-        required=True,
-        expected_outputs=("4-2.news_ai_summary.xlsx", "4-2.news_ai_cumulative.xlsx"),
-        timeout_sec=1800,
-    ),
-]
 
-STAGE_5 = [
+# =============================================================================
+# NEWS BRANCH
+# =============================================================================
+
+NEWS_COLLECTOR_STEPS = [
     Step(
-        "STEP5_MAIL_ENGINE",
-        "5.GTI_Mail_Engine.py",
-        required=True,
-        expected_outputs=(),
-        args=(
-            "--regulation-input",
-            str(BASE_DIR / "4-1.regulation_ai_summary.xlsx"),
-            "--news-input",
-            str(BASE_DIR / "4-2.news_ai_summary.xlsx"),
-            "--output-dir",
-            str(MAIL_OUTPUT_DIR),
-        ),
+        name="NEWS_2_1_NAVER",
+        script="2-1.NAVER_news_collector.py",
+        required=False,
+        expected_outputs=("2-1.naver_news_raw.xlsx",),
         timeout_sec=1200,
     ),
+    Step(
+        name="NEWS_2_2_GOOGLE",
+        script="2-2.google_news_collector.py",
+        required=False,
+        expected_outputs=("2-2.google_news_raw.xlsx",),
+        timeout_sec=1800,
+    ),
+    Step(
+        name="NEWS_2_3_RSS_SITE",
+        script="2-3.rss_news_raw.py",
+        required=False,
+        expected_outputs=("2-3.rss_news_raw.xlsx",),
+        timeout_sec=1800,
+    ),
 ]
 
+NEWS_POST_STEPS = [
+    Step(
+        name="NEWS_3_2_MERGE",
+        script="3-2.news_merge.py",
+        expected_outputs=(
+            "3-2.news_summary.xlsx",
+            "3-2.news_cumulative.xlsx",
+        ),
+        min_rows={"3-2.news_summary.xlsx": 1},
+        timeout_sec=1800,
+    ),
+    Step(
+        name="NEWS_4_2_AI",
+        script="4-2.news_ai_analysis.py",
+        expected_outputs=(
+            "4-2.news_ai_summary.xlsx",
+            "4-2.news_ai_cumulative.xlsx",
+        ),
+        # Zero selected news is a valid quality-gate result when the workbook
+        # was freshly generated and still has its schema/header.
+        timeout_sec=7200,
+        idle_timeout_sec=900,
+    ),
+]
+
+
+# =============================================================================
+# FINAL MAIL
+# =============================================================================
+
+MAIL_STEP = Step(
+    name="FINAL_5_MAIL",
+    script="5.GTI_Mail_Engine.py",
+    expected_outputs=(),
+    args=(
+        "--regulation-input",
+        str(BASE_DIR / "4-1.regulation_ai_summary.xlsx"),
+        "--news-input",
+        str(BASE_DIR / "4-2.news_ai_summary.xlsx"),
+        "--output-dir",
+        str(MAIL_OUTPUT_DIR),
+    ),
+    timeout_sec=1800,
+)
+
+
 ARCHIVE_TARGETS = [
-    "1.site_news_raw.xlsx",
-    "1.site_news_audit.xlsx",
+    # Regulation
     "1-1.regulation_raw.xlsx",
-    "1-2.site_news_raw.xlsx",
+    "3-1.regulation_summary.xlsx",
+    "3-1.regulation_article_summary.xlsx",
+    "3-1.regulation_cumulative.xlsx",
+    "3-1.regulation_audit.xlsx",
+    "3-1.regulation_excluded.xlsx",
+    "3-1.regulation_cumulative_removed.xlsx",
+    "4-1.regulation_ai_summary.xlsx",
+    "4-1.regulation_ai_cumulative.xlsx",
+    "4-1.regulation_ai_excluded.xlsx",
+    "4-1.regulation_ai_diagnostic.xlsx",
+
+    # News
     "2-1.naver_news_raw.xlsx",
     "2-2.google_news_raw.xlsx",
     "2-3.rss_news_raw.xlsx",
-    "3-1.regulation_summary.xlsx",
-    "3-1.regulation_cumulative.xlsx",
     "3-2.news_summary.xlsx",
     "3-2.news_cumulative.xlsx",
-    "3-1.regulation_article_summary.xlsx",
-    "3-2.news_article_summary.xlsx",
-    "4-1.regulation_ai_summary.xlsx",
-    "4-1.regulation_ai_cumulative.xlsx",
+    "3-2.news_excluded.xlsx",
+    "3-2.news_cluster_audit.xlsx",
     "4-2.news_ai_summary.xlsx",
     "4-2.news_ai_cumulative.xlsx",
     "4-2.news_ai_audit_candidates.xlsx",
     "4-2.news_ai_excluded.xlsx",
-    "4-1.regulation_ai_excluded.xlsx",
-    "3-2.news_article_before_cluster.xlsx",
-    "1.site_news_reject_debug.xlsx",
-    "1.site_news_final_excluded.xlsx",
-    "1-1.regulation_review_raw.xlsx",
-    "1-1.regulation_new_raw.xlsx",
+
+    # Final
     "4.gti_mail_input.xlsx",
     "GTI_Radar.xlsx",
     "mail_cumulative.xlsx",
@@ -192,355 +271,488 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def log(msg: str = "") -> None:
+    line = f"[{now()}] {msg}"
+    print(line)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
 def ensure_dirs() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     MAIL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def apply_pipeline_env_defaults() -> None:
-    for key, value in PIPELINE_ENV_DEFAULTS.items():
-        os.environ.setdefault(key, value)
+def apply_env_defaults() -> None:
+    for k, v in PIPELINE_ENV_DEFAULTS.items():
+        os.environ.setdefault(k, v)
 
 
-def log(message: str = "") -> None:
-    line = f"[{now()}] {message}"
-    print(line)
+def enable_windows_sleep_guard() -> None:
+    """Keep an unattended Windows pipeline awake until this process exits."""
+    if os.name != "nt":
+        return
     try:
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except PermissionError:
-        pass
+        import ctypes
+
+        es_continuous = 0x80000000
+        es_system_required = 0x00000001
+        result = ctypes.windll.kernel32.SetThreadExecutionState(
+            es_continuous | es_system_required
+        )
+        if result:
+            log("WINDOWS SLEEP GUARD : enabled")
+
+            def restore() -> None:
+                try:
+                    ctypes.windll.kernel32.SetThreadExecutionState(es_continuous)
+                except Exception:
+                    pass
+
+            atexit.register(restore)
+        else:
+            log("WINDOWS SLEEP GUARD WARN : activation returned 0")
+    except Exception as exc:
+        log(f"WINDOWS SLEEP GUARD WARN : {type(exc).__name__}: {exc}")
 
 
-def get_python_exe() -> str:
+def get_python() -> str:
     candidates = [
         str(PYTHON_EXE),
         sys.executable,
         shutil.which("python"),
         shutil.which("py"),
     ]
-    for exe in candidates:
-        if exe and Path(exe).exists():
-            return exe
+    for x in candidates:
+        if x and Path(x).exists():
+            return x
     return sys.executable
 
 
-def file_has_rows(path: Path) -> bool:
-    if not path.exists() or path.stat().st_size == 0:
-        return False
-    if path.suffix.lower() not in {".xlsx", ".xls"}:
-        return True
+def excel_row_count(path: Path) -> int:
     try:
-        df = pd.read_excel(path, nrows=2)
-        return len(df) > 0 or len(df.columns) > 0
+        if not path.exists() or path.stat().st_size == 0:
+            return -1
+        return len(pd.read_excel(path))
     except Exception:
-        return False
+        return -1
 
 
-def mail_run_date() -> str:
-    return os.getenv("GTI_RUN_DATE", datetime.now().strftime("%Y-%m-%d"))
+def valid_output(path: Path, started_at: float, min_rows: int | None = None) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "missing"
+
+    if path.stat().st_size == 0:
+        return False, "empty file"
+
+    # Must be generated/refreshed by this run.
+    if path.stat().st_mtime + 1 < started_at:
+        return False, "not refreshed"
+
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        try:
+            df = pd.read_excel(path)
+        except Exception as exc:
+            return False, f"excel read error:{type(exc).__name__}"
+
+        # Regulation can legitimately be zero rows. A valid header is enough.
+        if len(df.columns) == 0:
+            return False, "no columns"
+
+        if min_rows is not None and len(df) < min_rows:
+            return False, f"rows={len(df)} < {min_rows}"
+
+    return True, ""
 
 
-def validate_mail_outputs() -> tuple[bool, list[str]]:
-    run_date = mail_run_date()
-    expected = [
-        MAIL_OUTPUT_DIR / f"[GTI Radar] Global Trade Intelligence({run_date}).html",
-        MAIL_OUTPUT_DIR / f"[GTI Radar] Global Trade Intelligence({run_date}).xlsx",
-    ]
-    missing_or_empty = [str(path) for path in expected if not file_has_rows(path)]
-    return not missing_or_empty, missing_or_empty
+def validate_step_outputs(step: Step, started_at: float) -> tuple[bool, list[str]]:
+    bad = []
 
-
-def validate_outputs(step: Step) -> tuple[bool, list[str]]:
-    if step.name == "STEP5_MAIL_ENGINE":
-        return validate_mail_outputs()
-
-    missing_or_empty: list[str] = []
     for filename in step.expected_outputs:
         path = BASE_DIR / filename
-        if not file_has_rows(path):
-            missing_or_empty.append(filename)
-    return not missing_or_empty, missing_or_empty
+        ok, reason = valid_output(
+            path,
+            started_at,
+            step.min_rows.get(filename),
+        )
+        if not ok:
+            bad.append(f"{filename} ({reason})")
+
+    return not bad, bad
 
 
-def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
-    script_path = BASE_DIR / step.script
+def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
+    script = BASE_DIR / step.script
+
     log("=" * 80)
     log(f"{step.name} START : {step.script}")
     log("=" * 80)
 
-    if not script_path.exists():
-        log(f"FILE NOT FOUND : {step.script}")
+    if not script.exists():
+        log(f"FILE NOT FOUND : {script}")
         return "FAILED" if step.required else "SKIPPED"
 
-    command = [python_exe, str(script_path), *step.args]
-    log("COMMAND : " + " ".join(f'"{x}"' if " " in x else x for x in command))
+    # -u is essential for long AI stages: progress must reach this watchdog
+    # immediately instead of remaining in the child process' stdout buffer.
+    cmd = [python_exe, "-u", str(script), *step.args]
+    log("COMMAND : " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
 
     if dry_run:
-        log(f"DRY RUN SKIPPED : {step.script}")
         return "DRY_RUN"
 
-    start = time.time()
+    started = time.time()
+
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
-    if step.timeout_sec:
-        log(f"TIMEOUT : {step.timeout_sec} sec")
+    env.setdefault("PYTHONUNBUFFERED", "1")
 
     proc = subprocess.Popen(
-        command,
+        cmd,
         cwd=str(BASE_DIR),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
     )
+
     assert proc.stdout is not None
 
-    output_queue: queue.Queue[str | None] = queue.Queue()
+    q: queue.Queue[str | None] = queue.Queue()
 
-    def _reader() -> None:
+    def reader():
         try:
-            for out_line in proc.stdout:
-                output_queue.put(out_line)
+            for line in proc.stdout:
+                q.put(line)
         finally:
-            output_queue.put(None)
+            q.put(None)
 
-    reader = threading.Thread(target=_reader, daemon=True)
-    reader.start()
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
     reader_done = False
     timed_out = False
+    timeout_reason = ""
+    last_output_at = time.monotonic()
+    started_mono = time.monotonic()
 
     while True:
         try:
-            out_line = output_queue.get(timeout=0.5)
-            if out_line is None:
+            item = q.get(timeout=0.5)
+            if item is None:
                 reader_done = True
             else:
-                log(f"  {out_line.rstrip()}")
+                last_output_at = time.monotonic()
+                log("  " + item.rstrip())
         except queue.Empty:
             pass
 
-        if step.timeout_sec and proc.poll() is None and (time.time() - start) > step.timeout_sec:
+        if (
+            step.timeout_sec
+            and proc.poll() is None
+            and time.monotonic() - started_mono > step.timeout_sec
+        ):
             timed_out = True
-            log(f"{step.name} TIMEOUT : exceeded {step.timeout_sec} sec; terminating process tree")
+            timeout_reason = f"hard limit {step.timeout_sec} sec"
+            log(f"TIMEOUT : {timeout_reason}")
+        elif (
+            step.idle_timeout_sec
+            and proc.poll() is None
+            and time.monotonic() - last_output_at > step.idle_timeout_sec
+        ):
+            timed_out = True
+            timeout_reason = f"no child output for {step.idle_timeout_sec} sec"
+            log(f"TIMEOUT : {timeout_reason}")
+
+        if timed_out:
             try:
                 if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                 else:
                     proc.kill()
-            except Exception as exc:
-                log(f"{step.name} TIMEOUT KILL WARN : {exc}")
+            except Exception:
+                pass
             break
 
-        if proc.poll() is not None:
-            if reader_done:
-                break
-            reader.join(timeout=2)
-            if not reader.is_alive():
-                reader_done = True
-                break
-            log(f"{step.name} OUTPUT READER WARN : process ended but output reader is still waiting; continuing")
+        if proc.poll() is not None and reader_done:
             break
 
     try:
-        reader.join(timeout=2)
-    except RuntimeError:
+        thread.join(timeout=2)
+    except Exception:
         pass
 
-    while not output_queue.empty():
-        out_line = output_queue.get_nowait()
-        if out_line:
-            log(f"  {out_line.rstrip()}")
+    while not q.empty():
+        item = q.get_nowait()
+        if item:
+            log("  " + item.rstrip())
 
-    return_code = proc.wait()
-    elapsed = round(time.time() - start, 2)
+    rc = proc.wait()
+    elapsed = round(time.time() - started, 2)
 
     if timed_out:
-        log(f"{step.name} FAILED : timeout / {elapsed} sec")
+        log(f"{step.name} FAILED : {timeout_reason} / {elapsed}s")
         return "FAILED" if step.required else "WARNING"
 
-    if return_code != 0:
-        log(f"{step.name} FAILED : return_code={return_code} / {elapsed} sec")
+    if rc != 0:
+        log(f"{step.name} FAILED : return_code={rc} / {elapsed}s")
         return "FAILED" if step.required else "WARNING"
 
-    ok, bad_outputs = validate_outputs(step)
+    ok, bad = validate_step_outputs(step, started)
     if not ok:
-        log(f"{step.name} OUTPUT CHECK FAILED : {', '.join(bad_outputs)}")
+        log(f"{step.name} OUTPUT CHECK FAILED : {' / '.join(bad)}")
         return "FAILED" if step.required else "WARNING"
 
-    log(f"{step.name} COMPLETE : {elapsed} sec")
+    log(f"{step.name} COMPLETE : {elapsed}s")
     return "OK"
 
 
-def archive_outputs() -> None:
+def archive_previous() -> None:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target_dir = ARCHIVE_DIR / stamp
-    target_dir.mkdir(parents=True, exist_ok=True)
+    folder = ARCHIVE_DIR / stamp
+    folder.mkdir(parents=True, exist_ok=True)
 
-    copied = 0
+    count = 0
     for filename in ARCHIVE_TARGETS:
         src = BASE_DIR / filename
-        if src.exists():
-            try:
-                shutil.copy2(src, target_dir / filename)
-                copied += 1
-                log(f"ARCHIVE OK : {filename}")
-            except Exception as exc:
-                log(f"ARCHIVE FAIL : {filename} / {exc}")
-
-    log(f"ARCHIVE COMPLETE : {copied} files -> {target_dir}")
-
-
-def collapse_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Merge duplicate column names created by normalization aliases."""
-    if df.columns.is_unique:
-        return df
-
-    merged: list[pd.Series] = []
-    names = list(dict.fromkeys(df.columns))
-    for name in names:
-        same_name = df.loc[:, df.columns == name]
-        if same_name.shape[1] == 1:
-            series = same_name.iloc[:, 0]
-        else:
-            series = same_name.replace("", pd.NA).bfill(axis=1).iloc[:, 0].fillna("")
-        series.name = name
-        merged.append(series)
-
-    return pd.concat(merged, axis=1)
-
-
-def normalize_mail_columns(df: pd.DataFrame, category: str) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    rename_map = {
-        "Title": "Headline",
-        "title": "Headline",
-        "headline": "Headline",
-        "Link": "URL",
-        "link": "URL",
-        "url": "URL",
-        "Publisher": "Source",
-        "publisher": "Source",
-        "Agency": "agency",
-        "Risk": "risk",
-        "NewsType": "news_type",
-        "AI_Analysis": "AI Analysis",
-        "Action": "Action Plan",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    df = collapse_duplicate_columns(df)
-
-    required_cols = ["Date", "CollectedAt", "Headline", "URL", "Source", "agency", "risk", "score", "news_type"]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    if "KeywordMatches" in df.columns and "Keyword" not in df.columns:
-        df["Keyword"] = df["KeywordMatches"]
-    elif "Keyword" not in df.columns:
-        df["Keyword"] = category
-
-    if "Summary" not in df.columns:
-        df["Summary"] = ""
-    if "AI Analysis" not in df.columns:
-        df["AI Analysis"] = ""
-    if "Action Plan" not in df.columns:
-        df["Action Plan"] = ""
-
-    df["pipeline_category"] = category
-    df["Keyword"] = df["Keyword"].fillna("").astype(str)
-    df.loc[df["Keyword"].str.strip() == "", "Keyword"] = category
-
-    return df
-
-
-def build_mail_input() -> bool:
-    inputs = [
-        ("REGULATION", BASE_DIR / "4-1.regulation_ai_summary.xlsx"),
-        ("NEWS", BASE_DIR / "4-2.news_ai_summary.xlsx"),
-    ]
-
-    frames: list[pd.DataFrame] = []
-    for category, path in inputs:
-        if not path.exists():
-            log(f"MAIL INPUT SOURCE MISSING : {path.name}")
+        if not src.exists():
             continue
         try:
-            df = pd.read_excel(path)
-            df = normalize_mail_columns(df, category)
-            frames.append(df)
-            log(f"MAIL INPUT SOURCE OK : {path.name} / rows={len(df)}")
+            shutil.copy2(src, folder / filename)
+            count += 1
         except Exception as exc:
-            log(f"MAIL INPUT SOURCE FAIL : {path.name} / {exc}")
+            log(f"ARCHIVE WARN : {filename} / {exc}")
 
-    if not frames:
-        log("MAIL INPUT BUILD FAILED : no source rows")
-        return False
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.dropna(how="all")
-    combined = combined[
-        (combined["Headline"].fillna("").astype(str).str.strip() != "")
-        & (combined["URL"].fillna("").astype(str).str.strip() != "")
-    ]
-
-    if combined.empty:
-        log("MAIL INPUT BUILD FAILED : combined file has no valid rows")
-        return False
-
-    sort_cols = [c for c in ["pipeline_category", "score", "Date", "CollectedAt"] if c in combined.columns]
-    if sort_cols:
-        ascending = [True if c == "pipeline_category" else False for c in sort_cols]
-        combined = combined.sort_values(sort_cols, ascending=ascending, kind="stable")
-
-    combined.to_excel(MAIL_INPUT_FILE, index=False)
-    log(f"MAIL INPUT CREATED : {MAIL_INPUT_FILE} / rows={len(combined)}")
-    return True
+    log(f"ARCHIVE COMPLETE : {count} files -> {folder}")
 
 
-def run_stage(
-    stage_name: str,
-    steps: list[Step],
+def run_regulation_branch(
     python_exe: str,
     dry_run: bool,
-    keep_going: bool,
     results: list[tuple[str, str, str]],
 ) -> bool:
     log("")
     log("#" * 80)
-    log(f"{stage_name} START")
+    log("REGULATION BRANCH START")
     log("#" * 80)
 
-    stage_ok = True
-    for step in steps:
-        status = run_script(step, python_exe, dry_run=dry_run)
+    for step in REGULATION_STEPS:
+        status = run_step(step, python_exe, dry_run)
         results.append((step.name, step.script, status))
 
-        if step.required and status == "FAILED":
-            stage_ok = False
-            log(f"PIPELINE REQUIRED STEP FAILED : {step.name}")
-            if not keep_going:
-                return False
+        if status == "FAILED":
+            log(f"REGULATION BRANCH STOP : {step.name}")
+            return False
 
-    return stage_ok
+    log("REGULATION BRANCH COMPLETE")
+    return True
+
+
+
+NEWS_RAW_BY_STEP = {
+    "NEWS_2_1_NAVER": BASE_DIR / "2-1.naver_news_raw.xlsx",
+    "NEWS_2_2_GOOGLE": BASE_DIR / "2-2.google_news_raw.xlsx",
+    "NEWS_2_3_RSS_SITE": BASE_DIR / "2-3.rss_news_raw.xlsx",
+}
+
+def purge_news_raw_before_collectors() -> None:
+    """
+    Remove previous-run raw files after archiving.
+    This prevents a missing/failed collector from leaking yesterday's raw data
+    into today's 3-2 merge.
+    """
+    for path in NEWS_RAW_BY_STEP.values():
+        if path.exists():
+            try:
+                path.unlink()
+                log(f"STALE RAW PURGED : {path.name}")
+            except Exception as exc:
+                log(f"STALE RAW PURGE FAILED : {path.name} / {exc}")
+
+
+def run_news_branch(
+    python_exe: str,
+    dry_run: bool,
+    results: list[tuple[str, str, str]],
+) -> bool:
+    log("")
+    log("#" * 80)
+    log("NEWS BRANCH START")
+    log("#" * 80)
+
+    if not dry_run:
+        purge_news_raw_before_collectors()
+
+    collector_ok = 0
+    collector_statuses = {}
+
+    for step in NEWS_COLLECTOR_STEPS:
+        status = run_step(step, python_exe, dry_run)
+        collector_statuses[step.name] = status
+        results.append((step.name, step.script, status))
+
+        if status in {"OK", "DRY_RUN"}:
+            collector_ok += 1
+        elif not dry_run:
+            stale = NEWS_RAW_BY_STEP.get(step.name)
+            if stale and stale.exists():
+                try:
+                    stale.unlink()
+                    log(f"FAILED COLLECTOR RAW REMOVED : {stale.name}")
+                except Exception as exc:
+                    log(f"FAILED COLLECTOR RAW REMOVE WARN : {stale.name} / {exc}")
+
+    if collector_ok == 0:
+        log("NEWS BRANCH STOP : no collector available")
+        if not dry_run:
+            PIPELINE_STATUS_FILE.write_text(json.dumps({
+                "checked_at": now(), "news_branch": "FAIL",
+                "news_warning_count": 3, "collectors": collector_statuses,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        return False
+
+    for step in NEWS_POST_STEPS:
+        status = run_step(step, python_exe, dry_run)
+        results.append((step.name, step.script, status))
+
+        if status == "FAILED":
+            log(f"NEWS BRANCH STOP : {step.name}")
+            if not dry_run:
+                PIPELINE_STATUS_FILE.write_text(json.dumps({
+                    "checked_at": now(), "news_branch": "FAIL",
+                    "news_warning_count": max(1, 3 - collector_ok),
+                    "collectors": collector_statuses, "failed_step": step.name,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+            return False
+
+    if not dry_run:
+        missing_count = max(0, len(NEWS_COLLECTOR_STEPS) - collector_ok)
+        PIPELINE_STATUS_FILE.write_text(json.dumps({
+            "checked_at": now(),
+            "news_branch": "OK" if missing_count == 0 else "WARNING",
+            "news_warning_count": missing_count,
+            "collectors": collector_statuses,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        if missing_count:
+            log(f"NEWS BRANCH WARNING : {missing_count}/3 collector input missing; final report must disclose this")
+    log("NEWS BRANCH COMPLETE")
+    return True
+
+
+def ai_outputs_current_run_ready(
+    run_started_at: float,
+    regulation_ok: bool,
+    news_ok: bool,
+) -> tuple[bool, list[str]]:
+    checks = []
+    if regulation_ok:
+        checks.append(BASE_DIR / "4-1.regulation_ai_summary.xlsx")
+    if news_ok:
+        checks.append(BASE_DIR / "4-2.news_ai_summary.xlsx")
+
+    bad = []
+
+    for path in checks:
+        if not path.exists():
+            bad.append(f"{path.name}:missing")
+            continue
+
+        if path.stat().st_mtime + 1 < run_started_at:
+            bad.append(f"{path.name}:stale")
+            continue
+
+        try:
+            df = pd.read_excel(path)
+            if len(df.columns) == 0:
+                bad.append(f"{path.name}:no columns")
+        except Exception as exc:
+            bad.append(f"{path.name}:{type(exc).__name__}")
+
+    return not bad, bad
+
+
+def mail_step_for_current_branches(regulation_ok: bool, news_ok: bool) -> Step:
+    """Build Step5 arguments without exposing a failed branch's stale file."""
+    unavailable_dir = BASE_DIR / "_gti_current_run_unavailable"
+    regulation_input = (
+        BASE_DIR / "4-1.regulation_ai_summary.xlsx"
+        if regulation_ok
+        else unavailable_dir / "regulation_not_available.xlsx"
+    )
+    news_input = (
+        BASE_DIR / "4-2.news_ai_summary.xlsx"
+        if news_ok
+        else unavailable_dir / "news_not_available.xlsx"
+    )
+    return Step(
+        name=MAIL_STEP.name,
+        script=MAIL_STEP.script,
+        expected_outputs=MAIL_STEP.expected_outputs,
+        args=(
+            "--regulation-input", str(regulation_input),
+            "--news-input", str(news_input),
+            "--output-dir", str(MAIL_OUTPUT_DIR),
+        ),
+        timeout_sec=MAIL_STEP.timeout_sec,
+    )
+
+
+def run_mail(
+    python_exe: str,
+    dry_run: bool,
+    run_started_at: float,
+    regulation_ok: bool,
+    news_ok: bool,
+    results: list[tuple[str, str, str]],
+) -> bool:
+    log("")
+    log("#" * 80)
+    log("FINAL COMBINED MAIL START")
+    log("#" * 80)
+
+    if dry_run:
+        results.append((MAIL_STEP.name, MAIL_STEP.script, "DRY_RUN"))
+        return True
+
+    if not regulation_ok and not news_ok:
+        log("MAIL BLOCKED : neither branch produced a valid current-run AI output")
+        results.append((MAIL_STEP.name, MAIL_STEP.script, "SKIPPED"))
+        return False
+
+    ready, bad = ai_outputs_current_run_ready(run_started_at, regulation_ok, news_ok)
+    if not ready:
+        log("MAIL BLOCKED : stale/missing AI output / " + " / ".join(bad))
+        results.append((MAIL_STEP.name, MAIL_STEP.script, "SKIPPED"))
+        return False
+
+    mode = "COMBINED" if regulation_ok and news_ok else ("REGULATION-ONLY" if regulation_ok else "NEWS-ONLY")
+    log(f"MAIL MODE : {mode} / failed branch input is explicitly excluded")
+    current_mail_step = mail_step_for_current_branches(regulation_ok, news_ok)
+    status = run_step(current_mail_step, python_exe, dry_run=False)
+    results.append((MAIL_STEP.name, MAIL_STEP.script, status))
+    return status == "OK"
 
 
 def print_result(results: list[tuple[str, str, str]]) -> None:
+    log("")
     log("#" * 80)
-    log("GTI PIPELINE RESULT")
+    log("GTI PIPELINE v45 RESULT")
     log("#" * 80)
-
-    for step_name, script_file, status in results:
-        log(f"{step_name} / {script_file} : {status}")
 
     counts = {}
-    for _, _, status in results:
+    for name, script, status in results:
+        log(f"{name} / {script} : {status}")
         counts[status] = counts.get(status, 0) + 1
 
     log("-" * 80)
@@ -550,72 +762,90 @@ def print_result(results: list[tuple[str, str, str]]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run GTI law/news split pipeline")
-    parser.add_argument("--no-archive", action="store_true", help="Do not archive previous outputs before running")
-    parser.add_argument("--skip-mail", action="store_true", help="Run steps 1-4 only")
-    parser.add_argument("--keep-going", action="store_true", help="Continue after required step failures")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without running scripts")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="GTI v45 quality-contract regulation/news pipeline"
+    )
+    p.add_argument("--no-archive", action="store_true")
+    p.add_argument("--skip-mail", action="store_true")
+    p.add_argument("--regulation-only", action="store_true")
+    p.add_argument("--news-only", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
     ensure_dirs()
-    apply_pipeline_env_defaults()
+    apply_env_defaults()
+    enable_windows_sleep_guard()
+
+    run_started_at = time.time()
+    python_exe = get_python()
 
     log("#" * 80)
-    log("GTI LAW/NEWS SPLIT PIPELINE START")
+    log("GTI PIPELINE v45 - QUALITY CONTRACT + FAIL-SAFE LIVE WATCHDOG START")
     log("#" * 80)
     log(f"BASE_DIR : {BASE_DIR}")
+    log(f"PYTHON   : {python_exe}")
 
-    python_exe = get_python_exe()
-    log(f"PYTHON : {python_exe}")
-
-    if not args.no_archive:
-        archive_outputs()
+    if not args.no_archive and not args.dry_run:
+        archive_previous()
 
     results: list[tuple[str, str, str]] = []
 
-    stages = [
-        ("STAGE 1 - LAW1 OFFICIAL REGULATION CRAWL", STAGE_1),
-        ("STAGE 2 - NEWS COLLECTORS", STAGE_2),
-        ("STAGE 3 - NEWS MERGE", STAGE_3),
-        ("STAGE 3-1 - LAW1/NEWS ARTICLE SUMMARY", STAGE_3_ARTICLE),
-        ("STAGE 4 - LAW1/NEWS AI ANALYSIS", STAGE_4),
-    ]
+    regulation_ok = False
+    news_ok = False
 
-    pipeline_ok = True
-    for stage_name, steps in stages:
-        stage_ok = run_stage(stage_name, steps, python_exe, args.dry_run, args.keep_going, results)
-        pipeline_ok = pipeline_ok and stage_ok
-        if not stage_ok and not args.keep_going:
-            break
+    if not args.news_only:
+        regulation_ok = run_regulation_branch(
+            python_exe,
+            args.dry_run,
+            results,
+        )
 
-    if pipeline_ok and not args.skip_mail and not args.dry_run:
-        # Step5 v24+ reads 4-1/4-2 directly. 4.gti_mail_input.xlsx is built only as an optional audit file.
-        build_mail_input()
-        stage_ok = run_stage("STAGE 5 - MAIL", STAGE_5, python_exe, args.dry_run, args.keep_going, results)
-        pipeline_ok = pipeline_ok and stage_ok
-    elif args.skip_mail:
-        log("STAGE 5 SKIPPED BY OPTION")
-    elif args.dry_run:
-        log("MAIL INPUT BUILD SKIPPED BY DRY RUN")
+    if not args.regulation_only:
+        news_ok = run_news_branch(
+            python_exe,
+            args.dry_run,
+            results,
+        )
+
+    mail_ok = True
+
+    if args.skip_mail:
+        log("FINAL MAIL SKIPPED BY OPTION")
+    elif args.regulation_only or args.news_only:
+        log("FINAL MAIL SKIPPED : single-branch mode")
+    else:
+        mail_ok = run_mail(
+            python_exe,
+            args.dry_run,
+            run_started_at,
+            regulation_ok,
+            news_ok,
+            results,
+        )
 
     print_result(results)
 
-    if pipeline_ok and not any(status == "FAILED" for _, _, status in results):
-        log("GTI PIPELINE FINISHED")
+    failed = any(status == "FAILED" for _, _, status in results)
+
+    if (
+        not failed
+        and (args.regulation_only or regulation_ok)
+        and (args.news_only or news_ok)
+        and mail_ok
+    ):
+        log("GTI PIPELINE v45 FINISHED")
         return 0
 
-    log("GTI PIPELINE FINISHED WITH ERROR")
+    if mail_ok and (regulation_ok or news_ok):
+        log("GTI PIPELINE v45 FINISHED WITH PARTIAL REPORT")
+    else:
+        log("GTI PIPELINE v45 FINISHED WITH ERROR")
     return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
