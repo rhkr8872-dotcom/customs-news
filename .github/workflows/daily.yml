@@ -33,12 +33,12 @@ jobs:
       GTI_LOOKBACK_HOURS: "24"
       GTI_MAX_PER_SOURCE: "50"
 
-      GTI_SEND_EMAIL_SECRET: ${{ secrets.GTI_SEND_EMAIL }}
-      GTI_SMTP_HOST: ${{ secrets.GTI_SMTP_HOST }}
-      GTI_SMTP_PORT: ${{ secrets.GTI_SMTP_PORT }}
-      GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
-      GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
-      GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
+      GTI_SEND_EMAIL_SECRET: ${{ secrets.GTI_SEND_EMAIL }}  # 필요시 추가
+      GTI_SMTP_HOST: ${{ secrets.SMTP_SERVER }}
+      GTI_SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      GTI_SMTP_USER: ${{ secrets.SMTP_EMAIL }}
+      GTI_SMTP_PASS: ${{ secrets.SMTP_PASSWORD }}
+      GTI_MAIL_TO: ${{ secrets.RECIPIENTS }}
 
       NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
       NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
