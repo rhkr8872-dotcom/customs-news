@@ -124,7 +124,7 @@ jobs:
             "C:\temp\5.GTI_Mail_Engine.py",
             "C:\temp\7.run_gti_pipeline.py",
             "C:\temp\gti_report_window.py",
-            "C:\temp\gti_quality_contract.py"
+            "C:\temp\gti_quality_contract.py",
             "C:\temp\gti_action_queue_contract.py"
           )
           $missingFiles = $requiredFiles | Where-Object { -not (Test-Path $_) }
