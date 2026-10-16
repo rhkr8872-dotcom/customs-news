@@ -307,7 +307,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v52.1 EVIDENCE-FIRST EXECUTIVE BRIEF FINAL GATES"
+ENGINE_VERSION = "v52.2 CURRENT-EVENT OFFICIAL-EVIDENCE GATES"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -344,6 +344,15 @@ def _row_native_text(row: pd.Series) -> str:
 def _canonical_policy_family(row: pd.Series) -> str:
     """Stable event identity across publishers and Korean/English headlines."""
     t = _row_native_text(row)
+    # The same Korean decree is routinely published with a procedural title
+    # (Cabinet approval) and a substantive title (security/data restrictions).
+    # Both belong to one policy event.
+    if re.search(r"대외무역법\s*시행령|foreign trade act.{0,20}(?:decree|enforcement)", t, re.I) and re.search(
+        r"국무회의|경제안보|국가안보|정보\s*유출|정보\s*보호|수출입\s*제한|"
+        r"cabinet|economic security|national security|information protection|trade restriction",
+        t, re.I,
+    ):
+        return "KR_FOREIGN_TRADE_ACT_SECURITY_RESTRICTION_2026"
     if re.search(r"cbam|탄소국경조정", t, re.I) and re.search(
         r"미국|ustr|u\.s\.|united states", t, re.I
     ) and re.search(r"무역장벽|대응\s*조치|의견\s*수렴|trade barrier|response|comments", t, re.I):
@@ -480,6 +489,20 @@ def _context_noise(row: pd.Series) -> bool:
     private_service = bool(re.search(r"fedex|페덱스", t, re.I)) and bool(re.search(
         r"플랫폼|서비스|import tool|통합\s*결제|온라인\s*결제", t, re.I,
     )) and not samsung_named
+    unrelated_company_case = bool(re.search(
+        r"오스템|임플란트|치과용|osstem|implant", t, re.I,
+    )) and bool(re.search(
+        r"소송|판결|환급|추징|관세|litigation|judgment|refund|customs", t, re.I,
+    )) and not samsung_named
+    virtual_asset_policy = bool(re.search(
+        r"가상자산|암호화폐|코인거래소|crypto(?:currency)?|virtual asset", t, re.I,
+    )) and not samsung_named
+    unrelated_textile_trade_remedy = bool(re.search(
+        r"폴리에스터\s*원사|섬유|방적사|polyester\s*yarn|textile", t, re.I,
+    )) and not bool(re.search(
+        r"반도체|디스플레이|배터리|전자제품|삼성|semiconductor|display|battery|electronics",
+        t, re.I,
+    ))
     negotiation_only = bool(re.search(
         r"협상|negotiation|talks", title, re.I,
     )) and not bool(re.search(
@@ -490,13 +513,56 @@ def _context_noise(row: pd.Series) -> bool:
     )) and not bool(re.search(r"고시|개정|시행|제정|부과|금지|official notice|amended|effective", title, re.I))
     absolute_noise = (
         executive_or_generic_ai or agriculture_enforcement or unrelated_enforcement
-        or customs_training or private_service
+        or customs_training or private_service or unrelated_company_case
+        or virtual_asset_policy or unrelated_textile_trade_remedy
     )
     conditional_noise = (
         hard_noise or old_policy_rehash or opinion_or_history or employment_support
         or non_policy_story or negotiation_only or implementation_check_only
     ) and not samsung_named
     return absolute_noise or conditional_noise
+
+
+def _historical_policy_rehash(row: pd.Series) -> bool:
+    """Reject a newly posted article whose policy event is only historical.
+
+    Publication date is not policy-delta date.  A current article describing
+    an older effective/amendment date stays in the Excel audit unless the
+    article also proves a new current-year amendment, extension or decision.
+    """
+    if s(row.get("Content Type")).lower() == "regulation":
+        return False
+    headline = s(row.get("Headline"))
+    body = s(row.get("Article Body Evidence"))[:5000]
+    if not body:
+        return False
+    pub = pd.to_datetime(
+        row.get("Publish Date", row.get("Date", row.get("Original Publish Date"))),
+        errors="coerce",
+    )
+    report_year = int(pub.year) if not pd.isna(pub) else datetime.now().year
+    old_years = {
+        int(y) for y in re.findall(r"\b(20\d{2})\b", body)
+        if int(y) <= report_year - 1
+    }
+    if not old_years:
+        return False
+    old_effective = bool(re.search(
+        r"20(?:0\d|1\d|2[0-5])년?[^.\n]{0,45}(?:시행|발효|개정|도입|부과)|"
+        r"(?:시행|발효|개정|도입|부과)[^.\n]{0,45}20(?:0\d|1\d|2[0-5])년?|"
+        r"effective[^.\n]{0,45}(?:20(?:0\d|1\d|2[0-5]))",
+        body, re.I,
+    ))
+    current_delta = bool(re.search(
+        rf"{report_year}년?[^.\n]{{0,55}}(?:시행|발효|개정|연장|조사\s*개시|예비판정|최종판정|공포)|"
+        rf"(?:시행|발효|개정|연장|조사\s*개시|예비판정|최종판정|공포)[^.\n]{{0,55}}{report_year}년?",
+        body, re.I,
+    ))
+    retrospective_title = bool(re.search(
+        r"제도\s*개편|실무\s*변화\s*주목|해설|분석|가이드|총정리|"
+        r"overview|guide|explainer|what.*means", headline, re.I,
+    ))
+    return old_effective and not current_delta and retrospective_title
 
 
 def _samsung_watch_scope(row: pd.Series) -> bool:
@@ -941,7 +1007,8 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     # Samsung customs case, or a material official regulation pending review.
     protected_watch = direct_case | samsung_scope | rescued_customs | pending_regulation
     context_noise = d.apply(_context_noise, axis=1)
-    excluded_mask = administrative_only | (
+    historical_rehash = d.apply(_historical_policy_rehash, axis=1)
+    excluded_mask = administrative_only | historical_rehash | (
         (declared_excluded | context_noise) & ~protected_watch
     )
     # Direct requires official evidence, an actual mapped transaction and an
@@ -1034,8 +1101,8 @@ def evidence_status(row: pd.Series) -> str:
     if official and (body or gate or source_status in {"VERIFIED", "OFFICIAL", "PRIMARY"}):
         return "VERIFIED"
     if body or known(row.get("Direct Evidence")) or known(row.get("Article Body Evidence")):
-        return "SUPPORTED"
-    return "PENDING"
+        return "ARTICLE_VERIFIED / OFFICIAL_PENDING"
+    return "OFFICIAL_PENDING"
 
 
 def official_link(row: pd.Series) -> str:
@@ -1050,7 +1117,10 @@ def official_link(row: pd.Series) -> str:
 
 
 def analysis_record(row: pd.Series) -> dict[str, str]:
-    status = first_known(row, "EvidenceStatus", default="") or evidence_status(row)
+    # Recalculate presentation status from verifiable fields.  STEP4's
+    # EvidenceStatus may label a media-body extraction as SUPPORTED even when
+    # no exact official document URL exists.
+    status = evidence_status(row)
     return {
         "evidence": status,
         "effective": first_known(row, "EffectiveDate", "effective_date_hint"),
