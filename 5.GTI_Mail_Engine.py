@@ -12,6 +12,7 @@ import os
 import re
 import smtplib
 import ssl
+from urllib.parse import parse_qs, urlparse
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -307,7 +308,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v52.2 CURRENT-EVENT OFFICIAL-EVIDENCE GATES"
+ENGINE_VERSION = "v52.4 EVIDENCE-LOCK OMISSION-SAFE GATES"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -344,6 +345,21 @@ def _row_native_text(row: pd.Series) -> str:
 def _canonical_policy_family(row: pd.Series) -> str:
     """Stable event identity across publishers and Korean/English headlines."""
     t = _row_native_text(row)
+    # Cross-publisher identities observed in production.  These rules must run
+    # before trusting STEP4 EventKey because legacy/misclassified keys can name
+    # an entirely different event (for example a Taiwan control as a US tariff).
+    if re.search(r"중국|china|chinese", t, re.I) and re.search(
+        r"수출\s*(?:금지|제한)\s*기술\s*목록|export.{0,25}(?:prohibited|restricted).{0,20}technolog|"
+        r"수출통제.{0,30}(?:ai|인공지능).{0,30}(?:바이오|태양광)", t, re.I,
+    ) and re.search(r"의견\s*수렴|개정(?:안)?|consultation|revision|draft", t, re.I):
+        return "CN_EXPORT_RESTRICTED_TECH_LIST_CONSULTATION_2026"
+    if re.search(r"대만|taiwan", t, re.I) and re.search(
+        r"ai\s*(?:반도체|칩|서버)|첨단\s*반도체|ai\s*(?:chip|server)|advanced\s*semiconductor",
+        t, re.I,
+    ) and re.search(r"중국|china", t, re.I) and re.search(
+        r"수출통제|수출\s*(?:제한|금지)|export\s*control|export\s*restriction", t, re.I,
+    ):
+        return "TW_AI_SEMICON_SERVER_CN_EXPORT_CONTROL_2026"
     # The same Korean decree is routinely published with a procedural title
     # (Cabinet approval) and a substantive title (security/data restrictions).
     # Both belong to one policy event.
@@ -588,6 +604,21 @@ def _samsung_watch_scope(row: pd.Series) -> bool:
         r"삼성전자|삼성sdi|samsung electronics|samsung semiconductor|samsung sdi",
         t, re.I
     ))
+    # Opinion pieces and broad commodity-price stories do not become Samsung
+    # customs candidates merely because their body mentions manufacturing,
+    # servers or a possible downstream cost.  They require an explicit Samsung
+    # transaction map or Samsung itself in the source.
+    mapped_entity_text = s(row.get("MappedEntity"))
+    explicit_samsung_map = bool(re.search(r"samsung|삼성", mapped_entity_text, re.I))
+    if re.search(r"\[칼럼|\[기고|\[사설|오피니언|교수\s*칼럼|opinion|editorial", headline, re.I) \
+       and not (samsung_named or explicit_samsung_map):
+        return False
+    if re.search(r"cptpp", t, re.I) and re.search(r"농지|농민|농업|농어민|가입\s*보류", t, re.I) \
+       and not (samsung_named or explicit_samsung_map):
+        return False
+    if re.search(r"철강값|철강\s*가격|steel\s*price|공급\s*부족|페로알로이|ferroalloy", headline, re.I) \
+       and not (samsung_named or explicit_samsung_map):
+        return False
     customs = bool(re.search(
         r"관세|통관|품목분류|원산지|수출통제|전략물자|반덤핑|상계관세|cbam|"
         r"tariff|customs|hs\s*code|rules of origin|export control|anti-dumping|countervailing",
@@ -639,6 +670,8 @@ def _samsung_watch_scope(row: pd.Series) -> bool:
     )))
     # CustomsCaseFlag alone is never sufficient. Watch needs article-native
     # Samsung/peer electronics evidence or a complete Samsung transaction map.
+    # A generic AI/technology mention is insufficient.  Article-native text
+    # must identify an electronics product/peer or a specific electronic item.
     article_product_gate = headline_customs_product or (
         route and (explicit_electronics_link or specific_product) and ai_relevant
     )
@@ -702,6 +735,54 @@ def _direct_samsung_customs_case(row: pd.Series) -> bool:
     return body_verified and samsung and authority and concrete_action and not speculative and (declared or concrete_action)
 
 
+_OFFICIAL_HOSTS = re.compile(
+    r"(?:^|\.)(?:federalregister\.gov|govinfo\.gov|ustr\.gov|cbp\.gov|usitc\.gov|"
+    r"bis\.gov|trade\.gov|customs\.go\.kr|unipass\.customs\.go\.kr|gwanbo\.go\.kr|"
+    r"law\.go\.kr|motie\.go\.kr|moef\.go\.kr|dgft\.gov\.in|cbic\.gov\.in|"
+    r"taxation-customs\.ec\.europa\.eu|eur-lex\.europa\.eu)$",
+    re.I,
+)
+
+
+def _exact_official_document_url(value: object) -> bool:
+    """Accept an exact official document, never a portal/home/search/frontmatter URL.
+
+    This deliberately fails closed.  A rejected link is still retained as an
+    article/reference URL in Excel; it simply cannot prove Core Policy.
+    """
+    url = s(value)
+    if not url.startswith(("http://", "https://")):
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if not _OFFICIAL_HOSTS.search(host):
+        return False
+    path = (parsed.path or "/").rstrip("/").lower()
+    query = parse_qs(parsed.query)
+    # Home pages, search/listing pages and Federal Register front matter are
+    # navigation aids, not the exact legal/administrative document.
+    if path in {"", "/", "/documents", "/notices", "/notifications"}:
+        return False
+    if re.search(r"/(?:search|press-releases?|news|notices?|notifications?|documents/search)$", path):
+        return False
+    if "frontmatter" in path or re.search(r"/fr-\d{4}-\d{2}-\d{2}-frontmatter\.pdf$", path):
+        return False
+    # Known document-shaped routes and identifiers.
+    if re.search(
+        r"(?:\.pdf$|/documents/\d{4}/\d{2}/\d{2}/[^/]+/[^/]+$|/document/[^/]+$|"
+        r"/viewnotice/[^/]+$|/viewlaw/[^/]+$|/lawinfo/[^/]+$|/notice/[^/]+$|"
+        r"/notification/[^/]+$|/notifications/[^/]+/[^/]+$)",
+        path,
+        re.I,
+    ):
+        return True
+    id_keys = {"id", "documentid", "noticeid", "lawid", "seq", "ntt_id", "nttsn", "board_seq", "article_no"}
+    return any(k.lower() in id_keys and any(s(v) for v in values) for k, values in query.items())
+
+
 def _official_evidence(row: pd.Series) -> bool:
     """Official evidence must be a verified original, not a media claim."""
     source_flag = s(row.get("OfficialSourceFlag")).upper() == "Y"
@@ -709,11 +790,12 @@ def _official_evidence(row: pd.Series) -> bool:
         "VERIFIED", "VERIFIED_EXACT", "OFFICIAL_VERIFIED",
     }
     official_document = s(row.get("OfficialDocumentVerified")).upper() == "Y"
-    regulation_body = (
-        s(row.get("Content Type")).lower() == "regulation"
-        and s(row.get("Body Verified")).upper() == "Y"
-    )
-    return bool((source_flag and (source_status or official_document)) or regulation_body)
+    exact_url = any(_exact_official_document_url(row.get(col)) for col in (
+        "OfficialURL", "OfficialSourceURL",
+        # An upstream Regulation row may carry the exact official link in URL.
+        "URL" if s(row.get("Content Type")).lower() == "regulation" else "__none__",
+    ))
+    return bool(exact_url and source_flag and (source_status or official_document))
 
 
 def _final_policy_stage(row: pd.Series) -> bool:
@@ -866,8 +948,12 @@ def _collapse_policy_events(d: pd.DataFrame) -> pd.DataFrame:
         ascending=[True, False, False, False, False], kind="stable",
     )
     kept = []
-    for _, group in out.groupby("_quality_family", sort=False, dropna=False):
+    for family, group in out.groupby("_quality_family", sort=False, dropna=False):
         rep = group.iloc[0].copy()
+        # Persist the corrected identity.  The original EventKey can be a
+        # legacy AI label for a completely different policy family.
+        rep["CanonicalEventKey"] = family
+        rep["EventKey"] = family
         headlines = [s(x) for x in group.get("Headline", pd.Series(dtype=str)) if s(x)]
         urls = [s(x) for x in group.get("URL", pd.Series(dtype=str)) if s(x)]
         duplicate_values = group.get(
@@ -1034,6 +1120,20 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     used |= set(context.index)
     excluded = d[excluded_mask | ~d.index.isin(used)].copy()
 
+    # Every canonical event must have exactly one final disposition.  Items
+    # beyond a display cap are preserved in Excluded with an explicit reason;
+    # they are never silently dropped.
+    qualifying_layer = pd.Series("", index=d.index, dtype="object")
+    qualifying_layer.loc[action_mask] = "ACTION_QUEUE"
+    qualifying_layer.loc[core_mask] = "CORE_POLICY"
+    qualifying_layer.loc[watch_mask] = "SAMSUNG_WATCH"
+    qualifying_layer.loc[~excluded_mask & context_eligible & qualifying_layer.eq("")] = "GLOBAL_CONTEXT"
+    excluded["OmissionReason"] = "QUALITY_GATE_NOT_MET"
+    overflow = excluded.index.to_series().map(qualifying_layer).fillna("").ne("")
+    excluded.loc[overflow, "OmissionReason"] = (
+        "DISPLAY_CAP_OVERFLOW:" + excluded.index.to_series().map(qualifying_layer).fillna("")
+    ).loc[overflow]
+
     for frame, layer, status, reason in [
         (action, "ACTION_QUEUE", "Action Required", "삼성전자를 직접 대상으로 한 관세·품목분류·수출통제 조치 확인"),
         (core, "CORE_POLICY", "Core Policy", "신규 정책 변화와 공식 근거 확인"),
@@ -1043,8 +1143,13 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     ]:
         frame["ReportSection"] = layer
         frame["ReportLayer"] = layer
+        frame["FinalDisposition"] = layer
         frame["DecisionStatus"] = status
         frame["ContractReason"] = reason
+        # Never carry STEP4's broad SUPPORTED label into the final report.
+        # Recalculate from the exact official URL/status and article body.
+        if not frame.empty:
+            frame["EvidenceStatus"] = frame.apply(evidence_status, axis=1)
     if not core.empty:
         proposed = core.get("Policy Stage", pd.Series("", index=core.index)).fillna("").astype(str).str.upper().isin(
             {"PROPOSAL", "PROPOSED", "PROPOSED_OR_MONITORING", "DRAFT", "CONSULTATION", "FORECAST", "ANNOUNCED"}
@@ -1052,11 +1157,24 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
         core.loc[proposed, "DecisionStatus"] = "Scenario Analysis"
         core.loc[~proposed, "DecisionStatus"] = "Monitoring"
     if not watch.empty:
+        verified_watch_scope = watch.apply(_samsung_watch_scope, axis=1)
+        watch.loc[verified_watch_scope, "SamsungTradeGateFlag"] = "Y"
         proposed = watch.get("Policy Stage", pd.Series("", index=watch.index)).fillna("").astype(str).str.upper().isin(
             {"PROPOSAL", "PROPOSED", "PROPOSED_OR_MONITORING", "DRAFT", "CONSULTATION", "FORECAST", "ANNOUNCED"}
         )
         watch.loc[proposed, "DecisionStatus"] = "Scenario Analysis"
     visible = pd.concat([action, core, watch, context], ignore_index=True, sort=False)
+
+    disposition_frames = [action, core, watch, context, excluded]
+    disposition_indices = [idx for frame in disposition_frames for idx in frame.index.tolist()]
+    missing_indices = sorted(set(d.index) - set(disposition_indices))
+    repeated_indices = sorted({idx for idx in disposition_indices if disposition_indices.count(idx) > 1})
+    if missing_indices or repeated_indices or len(disposition_indices) != len(d):
+        raise RuntimeError(
+            "FINAL DISPOSITION CONTRACT VIOLATION: "
+            f"input={len(d)} accounted={len(disposition_indices)} "
+            f"missing={missing_indices} repeated={repeated_indices}"
+        )
     helper_cols = ["_score", "_family", "_evidence_rank", "_delta_rank", "_quality_family"]
     visible = visible.drop(columns=helper_cols, errors="ignore")
     layers = {"action": action.drop(columns=helper_cols, errors="ignore"),
@@ -1105,15 +1223,103 @@ def evidence_status(row: pd.Series) -> str:
     return "OFFICIAL_PENDING"
 
 
+def validate_final_contract(visible: pd.DataFrame, layers: dict[str, pd.DataFrame]) -> None:
+    """Fail closed when a final report violates an executive-layer contract."""
+    violations: list[str] = []
+
+    watch = layers.get("watch", pd.DataFrame())
+    if not watch.empty:
+        watch_body = watch.apply(lambda r: s(r.get("Body Verified")).upper() == "Y", axis=1)
+        watch_scope = watch.apply(
+            lambda r: _direct_samsung_customs_case(r)
+            or _samsung_watch_scope(r)
+            or _pending_official_regulation_watch(r),
+            axis=1,
+        )
+        bad = watch.loc[~(watch_body & watch_scope)]
+        if not bad.empty:
+            violations.append(
+                "WATCH_GATE=" + " | ".join(bad.get("Headline", pd.Series(dtype=str)).astype(str).tolist())
+            )
+
+    core = layers.get("core", pd.DataFrame())
+    if not core.empty:
+        bad = core.loc[~core.apply(_official_evidence, axis=1)]
+        if not bad.empty:
+            violations.append(
+                "CORE_OFFICIAL=" + " | ".join(bad.get("Headline", pd.Series(dtype=str)).astype(str).tolist())
+            )
+
+    action = layers.get("action", pd.DataFrame())
+    if not action.empty:
+        bad = action.loc[~action.apply(_strict_action_gate, axis=1)]
+        if not bad.empty:
+            violations.append(
+                "ACTION_GATE=" + " | ".join(bad.get("Headline", pd.Series(dtype=str)).astype(str).tolist())
+            )
+
+    if not visible.empty:
+        families = visible.apply(_canonical_policy_family, axis=1)
+        duplicated = visible.loc[families.duplicated(keep=False)]
+        if not duplicated.empty:
+            violations.append(
+                "EVENT_DUPLICATE="
+                + " | ".join(duplicated.get("Headline", pd.Series(dtype=str)).astype(str).tolist())
+            )
+        bad_status = visible.get("EvidenceStatus", pd.Series("", index=visible.index)).astype(str).eq("SUPPORTED")
+        if bad_status.any():
+            violations.append("EVIDENCE_LABEL=SUPPORTED")
+        verified = visible.get("EvidenceStatus", pd.Series("", index=visible.index)).astype(str).eq("VERIFIED")
+        bad_verified = visible.loc[verified & ~visible.apply(lambda r: bool(official_link(r)), axis=1)]
+        if not bad_verified.empty:
+            violations.append(
+                "VERIFIED_WITHOUT_EXACT_DOCUMENT="
+                + " | ".join(bad_verified.get("Headline", pd.Series(dtype=str)).astype(str).tolist())
+            )
+
+    if violations:
+        raise RuntimeError("FINAL REPORT CONTRACT VIOLATION: " + "; ".join(violations))
+    print("[STEP5 FINAL CONTRACT] action/watch/core/evidence/dedup violations=0")
+
+
 def official_link(row: pd.Series) -> str:
-    url = first_known(row, "OfficialURL", "OfficialSourceURL", default="")
-    if url.startswith(("http://", "https://")):
-        return url
-    if s(row.get("Content Type")).lower() == "regulation":
-        url = s(row.get("URL"))
-        if url.startswith(("http://", "https://")):
+    for col in ("OfficialURL", "OfficialSourceURL", "URL"):
+        if col == "URL" and s(row.get("Content Type")).lower() != "regulation":
+            continue
+        url = s(row.get(col))
+        if _exact_official_document_url(url):
             return url
     return ""
+
+
+def _source_evidence_text(row: pd.Series) -> str:
+    """Text that came from the source article/document, excluding AI prose."""
+    return " ".join(filter(None, [
+        s(row.get("Headline")), s(row.get("Direct Evidence")),
+        s(row.get("Article Body Evidence")), s(row.get("AffectedProduct")),
+        s(row.get("AffectedHS")), s(row.get("Agency")), s(row.get("Country")),
+    ]))
+
+
+def _grounded_narrative(candidate: object, evidence: str, fallback: str) -> str:
+    """Use AI prose only when its material anchors exist in source evidence."""
+    text = s(candidate)
+    if not known(text):
+        return fallback
+    evidence_cf = evidence.casefold()
+    candidate_cf = text.casefold()
+    numbers = set(re.findall(r"(?<!\w)\d+(?:[.,]\d+)?%?(?!\w)", candidate_cf))
+    evidence_numbers = set(re.findall(r"(?<!\w)\d+(?:[.,]\d+)?%?(?!\w)", evidence_cf))
+    if numbers - evidence_numbers:
+        return fallback
+    tokens = {
+        token for token in re.findall(r"[a-z]{4,}|[가-힣]{2,}", candidate_cf)
+        if token not in {"대한", "관련", "통해", "위해", "경우", "정책", "기사", "확인", "필요"}
+    }
+    if not tokens:
+        return fallback
+    matched = sum(token in evidence_cf for token in tokens)
+    return text if matched / len(tokens) >= 0.34 else fallback
 
 
 def analysis_record(row: pd.Series) -> dict[str, str]:
@@ -1121,15 +1327,38 @@ def analysis_record(row: pd.Series) -> dict[str, str]:
     # EvidenceStatus may label a media-body extraction as SUPPORTED even when
     # no exact official document URL exists.
     status = evidence_status(row)
+    evidence_text = _source_evidence_text(row)
+    headline = s(row.get("Headline")) or "정책 신호"
+    changed_fallback = f"원문에서 확인된 정책 신호: {headline}"
+    changed = _grounded_narrative(
+        first_known(row, "WhatChanged", "Summary"), evidence_text, changed_fallback
+    )
+    samsung_supported = (
+        _direct_samsung_customs_case(row)
+        or _transaction_evidence(row)
+        or _samsung_watch_scope(row)
+    )
+    if samsung_supported:
+        impact = _grounded_narrative(
+            first_known(row, "SamsungImpactPath", "AI Analysis"),
+            evidence_text,
+            "삼성전자 관련 가능성은 확인됐으나 법인·품목·HS·거래경로의 직접 연결은 추가 검증이 필요합니다.",
+        )
+    else:
+        impact = "삼성전자 법인·품목·HS·거래경로와의 직접 연결은 확인되지 않았습니다."
+    if _strict_action_gate(row):
+        action = concise(first_known(row, "RecommendedAction", "Action Plan"), 300)
+    else:
+        action = "공식 원문, 적용 품목·HS, 대상 법인 및 거래경로를 확인한 뒤 조치 여부를 결정합니다."
     return {
         "evidence": status,
         "effective": first_known(row, "EffectiveDate", "effective_date_hint"),
         "product": first_known(row, "AffectedProduct", "MappedProduct"),
         "hs": first_known(row, "AffectedHS", "MappedHS", "hs_hint"),
         "stage": first_known(row, "PolicyStageDisplay", "Policy Stage", "PolicyDeltaType"),
-        "changed": concise(first_known(row, "WhatChanged", "Summary"), 330),
-        "impact": concise(first_known(row, "SamsungImpactPath", "AI Analysis"), 360),
-        "action": concise(first_known(row, "RecommendedAction", "Action Plan"), 300),
+        "changed": concise(changed, 330),
+        "impact": concise(impact, 360),
+        "action": action,
         "missing": concise(first_known(row, "VerificationNeeded", "Missing Facts"), 220),
         "official_url": official_link(row),
     }
@@ -1311,6 +1540,23 @@ def write_xlsx_v50(path: Path, visible: pd.DataFrame, layers: dict[str, pd.DataF
                      "정책 단계", "시행·적용일", "대상 품목", "HS", "삼성전자 영향", "권고 조치",
                      "미확인 사항", "공식 원문", "근거 기사"]
     brief = pd.DataFrame(brief_rows, columns=brief_columns)
+    coverage_frames = []
+    for layer_name in ("action", "core", "watch", "context", "excluded"):
+        frame = layers[layer_name].copy()
+        if frame.empty:
+            continue
+        frame["CoverageDisposition"] = layer_name.upper()
+        coverage_frames.append(frame)
+    coverage = pd.concat(coverage_frames, ignore_index=True, sort=False) if coverage_frames else pd.DataFrame()
+    if not coverage.empty:
+        keep = [c for c in [
+            "CanonicalEventKey", "EventKey", "CoverageDisposition", "OmissionReason",
+            "Content Type", "Headline", "Original Publish Date", "Country", "Agency",
+            "EvidenceStatus", "PolicyDeltaFlag", "EvidenceGateFlag",
+            "SamsungTradeGateFlag", "URL", "OfficialURL", "OfficialSourceURL",
+            "AlternateHeadlines", "AlternateURLs",
+        ] if c in coverage.columns]
+        coverage = coverage[keep]
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="Executive Summary", index=False)
         brief.to_excel(writer, sheet_name="Executive Brief", index=False)
@@ -1319,6 +1565,7 @@ def write_xlsx_v50(path: Path, visible: pd.DataFrame, layers: dict[str, pd.DataF
         layers["context"].to_excel(writer, sheet_name="Global Context", index=False)
         visible.to_excel(writer, sheet_name="Details", index=False)
         layers["excluded"].to_excel(writer, sheet_name="Excluded", index=False)
+        coverage.to_excel(writer, sheet_name="Coverage Audit", index=False)
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
             for cell in ws[1]:
@@ -1388,7 +1635,11 @@ def main() -> int:
         rows["Original Publish Date"] = rows.apply(row_publication_date, axis=1)
         if "ExecutiveScore" not in rows:
             rows["ExecutiveScore"] = pd.to_numeric(rows.get("Importance Score", 0), errors="coerce").fillna(0)
-        rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable").drop_duplicates("EventKey", keep="first")
+        # Do not deduplicate on the upstream EventKey.  A stale or overly broad
+        # AI key can merge unrelated events and create a silent omission.  The
+        # canonical evidence-aware collapse in classify_report_layers is the
+        # single authoritative deduplication step.
+        rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable")
     old = pd.DataFrame() if args.preview else read_excel_safe(CUM_FILE)
     if same_day_rerun:
         historical_removed = 0
@@ -1405,6 +1656,7 @@ def main() -> int:
             print(f"[STEP5 CONTENT GUARD] excluded_title_only={len(low_quality)}")
         rows = rows.loc[quality_ok].reset_index(drop=True)
     visible, layers = classify_report_layers(rows)
+    validate_final_contract(visible, layers)
     health = health_summary()
     # "Official source pending" means an exact, clickable official document
     # URL is absent. A verified news body is supporting evidence, not an
