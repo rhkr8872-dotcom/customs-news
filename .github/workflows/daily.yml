@@ -195,7 +195,7 @@ jobs:
             Write-Error "GTI pipeline failed with exit code $pipelineExitCode"
             exit $pipelineExitCode
           }
-          
+                  
       - name: Copy results to outputs
         if: always()
         shell: pwsh
