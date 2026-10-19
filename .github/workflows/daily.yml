@@ -1,6 +1,6 @@
 on:
   schedule:
-    # 07:00 KST = 22:00 UTC (previous day)
+    # 05:00 KST = 20:00 UTC (previous day)
     - cron: "0 20 * * *"
   workflow_dispatch:
     inputs:
@@ -38,7 +38,8 @@ jobs:
       GTI_SMTP_USER: ${{ secrets.SMTP_EMAIL }}
       GTI_SMTP_PASS: ${{ secrets.SMTP_PASSWORD }}
       GTI_MAIL_TO: ${{ secrets.RECIPIENTS }}
-      GTI_SEND_EMAIL: "true"
+      GTI_SEND_EMAIL_SECRET: ${{ secrets.GTI_SEND_EMAIL || 'true' }}
+      GTI_SMTP_SECURITY: auto
     
       NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
       NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
@@ -58,13 +59,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Copy GTI program and configuration files
-        shell: pwsh
-        run: |
-          # 모든 파이썬(.py) 파일을 예외 없이 C:\temp로 복사
-          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter "*.py" |
-            Copy-Item -Destination "C:\temp" -Force
-            
       - name: Create folders
         shell: pwsh
         run: |
