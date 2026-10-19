@@ -58,7 +58,13 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-
+      - name: Copy GTI program and configuration files
+        shell: pwsh
+        run: |
+          # 모든 파이썬(.py) 파일을 예외 없이 C:\temp로 복사
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter "*.py" |
+            Copy-Item -Destination "C:\temp" -Force
+            
       - name: Create folders
         shell: pwsh
         run: |
