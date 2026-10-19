@@ -703,6 +703,7 @@ def mail_step_for_current_branches(regulation_ok: bool, news_ok: bool) -> Step:
             "--regulation-input", str(regulation_input),
             "--news-input", str(news_input),
             "--output-dir", str(MAIL_OUTPUT_DIR),
+            *(("--no-email",) if os.getenv("GTI_SEND_EMAIL", "true").strip().lower() not in {"true", "1", "yes", "y", "on"} else ()),
         ),
         timeout_sec=MAIL_STEP.timeout_sec,
     )

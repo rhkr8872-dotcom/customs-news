@@ -49,7 +49,7 @@ REPORT_TARGET = int(os.getenv("GTI_STEP4_NEWS_REPORT_TARGET", "30"))  # 품질 �
 WATCH_MIN_RELEVANCE = int(os.getenv("GTI_STEP4_WATCH_MIN_RELEVANCE", "3"))
 AI_TARIFF_QUOTA = int(os.getenv("GTI_STEP4_AI_TARIFF_QUOTA", "60"))
 AI_POLICY_COVERAGE_QUOTA = int(os.getenv("GTI_STEP4_AI_POLICY_COVERAGE_QUOTA", "60"))
-GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+GEMINI_MODEL = (os.getenv("GTI_GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 GEMINI_TIMEOUT = int(os.getenv("GTI_GEMINI_TIMEOUT", "20"))
 GEMINI_API_KEY = (
     os.getenv("GEMINI_API_KEY", "").strip()
@@ -1000,7 +1000,10 @@ def gemini_json(prompt: str) -> dict:
             timeout=GEMINI_TIMEOUT,
         )
         if r.status_code >= 400:
-            return {"_error": f"HTTP_{r.status_code}: {clean(r.text)[:500]}"}
+            detail = clean(r.text).replace(GEMINI_API_KEY, "***REDACTED***")
+            if "API_KEY_INVALID" in detail or "API key not valid" in detail:
+                return {"_error": "GEMINI_API_KEY_INVALID: Update GitHub Actions secret GEMINI_API_KEY with a valid Gemini API key. Analysis stopped; no fabricated AI results."}
+            return {"_error": f"HTTP_{r.status_code}: {detail[:500]}"}
         data = r.json()
         txt = data["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(txt)

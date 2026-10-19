@@ -30,8 +30,8 @@ NEWS_FILE = BASE / "4-2.news_ai_summary.xlsx"
 REG_FILE = BASE / "4-1.regulation_ai_summary.xlsx"
 CUM_FILE = BASE / "gti_news_cumulative.xlsx"
 RECIPIENT_FILE = BASE / "00.xlsx"
-SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
-SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
+SMTP_HOST = (os.getenv("GTI_SMTP_HOST") or "smtp.naver.com").strip()
+SMTP_PORT = int((os.getenv("GTI_SMTP_PORT") or "465").strip())
 SMTP_USER = os.getenv("GTI_SMTP_USER", "kch8872@naver.com").strip()
 SMTP_PASS = (os.getenv("GTI_SMTP_PASS") or os.getenv("GTI_MAIL_PW") or "").strip()
 
@@ -308,7 +308,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v52.4 EVIDENCE-LOCK OMISSION-SAFE GATES"
+ENGINE_VERSION = "v52.5.2 PENDING-REGULATION CONTEXT HOTFIX"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -345,6 +345,9 @@ def _row_native_text(row: pd.Series) -> str:
 def _canonical_policy_family(row: pd.Series) -> str:
     """Stable event identity across publishers and Korean/English headlines."""
     t = _row_native_text(row)
+    decision_text = " ".join([
+        s(row.get("Headline")), s(row.get("Direct Evidence")),
+    ]).lower()
     # Cross-publisher identities observed in production.  These rules must run
     # before trusting STEP4 EventKey because legacy/misclassified keys can name
     # an entirely different event (for example a Taiwan control as a US tariff).
@@ -401,9 +404,9 @@ def _canonical_policy_family(row: pd.Series) -> str:
         return "CN_EU_HYBRID_EXPORT_LIMIT_2026"
     if re.search(r"러시아|russia", t, re.I) and re.search(r"경유|diesel", t, re.I) and re.search(r"트럼프|trump|미국|u\.s\.", t, re.I):
         return "US_RUSSIA_DIESEL_DEAL_2026"
-    if re.search(r"lg전자|엘지전자|lg electronics", t, re.I) and re.search(r"인도|india", t, re.I) and re.search(r"로열티|royalt", t, re.I) and re.search(r"관세|customs|duty|과세", t, re.I):
+    if re.search(r"lg전자|엘지전자|lg electronics", decision_text, re.I) and re.search(r"인도|india", decision_text, re.I) and re.search(r"로열티|royalt", decision_text, re.I) and re.search(r"관세|customs|duty|과세", decision_text, re.I):
         return "IN_LG_ELECTRONICS_ROYALTY_CUSTOMS_ASSESSMENT"
-    if re.search(r"삼성전자|samsung electronics", t, re.I) and re.search(r"인도|india", t, re.I) and re.search(r"oled|디스플레이", t, re.I) and re.search(r"관세|customs|duty|추징|조사", t, re.I):
+    if re.search(r"삼성전자|samsung electronics", decision_text, re.I) and re.search(r"인도|india", decision_text, re.I) and re.search(r"oled|디스플레이", decision_text, re.I) and re.search(r"관세|customs|duty|추징|조사", decision_text, re.I):
         return "IN_SAMSUNG_OLED_CUSTOMS_CASE"
     if re.search(r"필리핀|philippines", t, re.I) and re.search(r"eu|유럽연합", t, re.I) and re.search(r"fta|자유무역협정", t, re.I):
         return "EU_PHILIPPINES_FTA_NEGOTIATION_2026"
@@ -444,10 +447,33 @@ def _canonical_policy_family(row: pd.Series) -> str:
         if all(any(term in t for term in group) for group in groups):
             return key
     existing = s(row.get("EventKey")) or s(row.get("Cluster"))
-    if existing and not existing.upper().startswith("AUTO_"):
+    if existing and not existing.upper().startswith("AUTO_") and _existing_event_key_consistent(existing, t):
         return existing.casefold()
     title = re.sub(r"[^0-9a-z가-힣%]+", " ", s(row.get("Headline")).lower())
     return "title:" + " ".join(title.split()[:14])
+
+
+def _existing_event_key_consistent(existing: str, native_text: str) -> bool:
+    """Reject a stale upstream identity when its named entities are absent.
+
+    STEP4 historically attached a Samsung/OLED customs key to an unrelated
+    lithium-mining article.  Existing keys remain useful for generic events,
+    but any specific entity/product encoded in the key must also occur in the
+    article-native text.
+    """
+    key = existing.casefold()
+    text = native_text.casefold()
+    anchors = {
+        "samsung": r"samsung|삼성",
+        "lg": r"(?:^|_)lg(?:_|$)|lg전자|엘지전자|lg electronics",
+        "oled": r"oled|유기발광",
+        "semicon": r"semiconductor|반도체|chip|칩",
+        "battery": r"battery|배터리|이차전지",
+        "cptpp": r"cptpp",
+        "cbam": r"cbam|탄소국경조정",
+    }
+    required = [pattern for token, pattern in anchors.items() if token in key]
+    return all(re.search(pattern, text, re.I) for pattern in required)
 
 
 def _context_noise(row: pd.Series) -> bool:
@@ -498,6 +524,15 @@ def _context_noise(row: pd.Series) -> bool:
         r"현장조사\s*거부|incoming passengers|duty-not-paid cigarettes|여행객|담배",
         title, re.I,
     ))
+    market_effect_story = bool(re.search(
+        r"가격.{0,20}(?:최고|급등|상승)|값.{0,20}(?:최고|급등|상승)|"
+        r"공급\s*부족|매출|실적|주가|price.{0,20}(?:high|rise|surge)|supply shortage",
+        title, re.I,
+    )) and not bool(re.search(
+        r"신규\s*부과|관세\s*(?:인상|인하|철회|폐지)|조사\s*개시|예비판정|최종판정|"
+        r"new\s+tariff|tariff\s+(?:increase|cut|withdrawal)|investigation initiated|final determination",
+        title, re.I,
+    ))
     customs_training = bool(re.search(
         r"(?:관세청|세관|customs).{0,50}(?:연수|교육|전수|training)|"
         r"(?:연수|교육|전수|training).{0,50}(?:관세청|세관|customs)", t, re.I,
@@ -534,7 +569,7 @@ def _context_noise(row: pd.Series) -> bool:
     )
     conditional_noise = (
         hard_noise or old_policy_rehash or opinion_or_history or employment_support
-        or non_policy_story or negotiation_only or implementation_check_only
+        or non_policy_story or market_effect_story or negotiation_only or implementation_check_only
     ) and not samsung_named
     return absolute_noise or conditional_noise
 
@@ -887,6 +922,55 @@ def _business_policy_change(row: pd.Series) -> bool:
     )
 
 
+def _material_trade_policy_candidate(row: pd.Series) -> bool:
+    """Rescue a concrete current trade-policy event into Global Context.
+
+    This does not promote the row to Core Policy and does not manufacture a
+    Samsung link.  It prevents material trade-remedy and customs-procedure
+    changes from disappearing only because STEP4 left PolicyDeltaFlag=N.
+    """
+    if s(row.get("Body Verified")).upper() != "Y":
+        return False
+    headline = s(row.get("Headline"))
+    # Deliberately exclude the full scraped body: navigation and related-news
+    # tails contain unrelated policy words and previously rescued noise.
+    decision_text = " ".join([headline, s(row.get("Direct Evidence"))])
+    if re.search(
+        r"가격.{0,20}(?:최고|급등|상승)|값.{0,20}(?:최고|급등|상승)|공급\s*부족|"
+        r"price.{0,20}(?:high|rise|surge)|supply shortage",
+        headline, re.I,
+    ):
+        return False
+    private_request_only = bool(re.search(
+        r"조사\s*신청|완화\s*요청|개선\s*요청|촉구|건의|petitions?|requests?|urges?",
+        headline, re.I,
+    )) and not bool(re.search(
+        r"조사\s*개시|조사\s*착수|예비판정|최종판정|관보|고시|공고|"
+        r"investigation initiated|preliminary determination|final determination|official notice",
+        decision_text, re.I,
+    ))
+    if private_request_only:
+        return False
+    policy_domain = bool(re.search(
+        r"반덤핑|상계관세|세이프가드|무역구제|무역\s*보호\s*조치|관세|통관|세관|수입신고|보세|원산지|"
+        r"수출통제|전략물자|산업가속화법|역내산|유럽산|"
+        r"anti-?dumping|countervailing|safeguard|trade remedy|tariff|customs|"
+        r"export control|strategic item|made in europe|industrial accelerator",
+        decision_text, re.I,
+    ))
+    current_measure = bool(re.search(
+        r"\d+년\s*연장|연장(?:한다|됐다|하기로)|잠정\s*(?:조치|관세|세율)|"
+        r"허용\s*추진|규정\s*변경|절차\s*변경|적용\s*확대|적용\s*축소|"
+        r"개정안|법안\s*발표|조사\s*개시|예비판정|최종판정|발효|시행|부과|"
+        r"extended?\s+(?:for\s+)?\d+\s*years?|provisional\s+(?:measure|duty)|"
+        r"일시적인\s*무역\s*보호\s*조치|temporary\s+trade\s+(?:defen[cs]e|measure)|"
+        r"amended|updated|implemented|imposed",
+        decision_text, re.I,
+    ))
+    old_rehash = _historical_policy_rehash(row)
+    return policy_domain and current_measure and not old_rehash
+
+
 def _global_context_candidate(row: pd.Series) -> bool:
     """Retain verified current customs/trade events without inventing impact.
 
@@ -896,7 +980,12 @@ def _global_context_candidate(row: pd.Series) -> bool:
     transaction mapping remains pending.  Commentary, historical background
     and unrelated-sector noise remain excluded by _context_noise.
     """
-    if _business_policy_change(row):
+    # An official, material regulation whose body is not yet verified must
+    # remain visible, but it is not Samsung Watch evidence.  Keep it in Global
+    # Context until the exact document and Samsung transaction link are proven.
+    if _pending_official_regulation_watch(row):
+        return True
+    if _business_policy_change(row) or _material_trade_policy_candidate(row):
         return True
     t = _row_native_text(row)
     body_verified = s(row.get("Body Verified")).upper() == "Y"
@@ -1089,13 +1178,16 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     # CustomsCaseFlag is only a case-type hint. It cannot promote a row by
     # itself. Strict article-native Samsung scope is mandatory.
     # Never promote a row merely because STEP4/AI set SamsungTradeGateFlag.
-    # Promotion requires article-native Samsung/electronics evidence, a direct
-    # Samsung customs case, or a material official regulation pending review.
-    protected_watch = direct_case | samsung_scope | rescued_customs | pending_regulation
+    # Promotion requires article-native Samsung/electronics evidence or a
+    # direct Samsung customs case.  A pending official regulation is visible
+    # in Global Context, but must never be promoted to Samsung Watch by itself.
+    protected_watch = direct_case | samsung_scope | rescued_customs
     context_noise = d.apply(_context_noise, axis=1)
     historical_rehash = d.apply(_historical_policy_rehash, axis=1)
+    material_trade_policy = d.apply(_material_trade_policy_candidate, axis=1)
+    context_protected = material_trade_policy | pending_regulation
     excluded_mask = administrative_only | historical_rehash | (
-        (declared_excluded | context_noise) & ~protected_watch
+        (declared_excluded | context_noise) & ~protected_watch & ~context_protected
     )
     # Direct requires official evidence, an actual mapped transaction and an
     # executable owner/deadline. A media report about a Samsung investigation
@@ -1112,7 +1204,7 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     watch = d[watch_mask].sort_values("_score", ascending=False, kind="stable").head(10).copy()
     watch = sort_by_country_and_publish_date(watch)
     used = set(action.index) | set(core.index) | set(watch.index)
-    context_eligible = d.apply(_global_context_candidate, axis=1)
+    context_eligible = d.apply(_global_context_candidate, axis=1) | pending_regulation
     context_candidates = d[
         ~excluded_mask & ~d.index.isin(used) & context_eligible
     ].copy()
@@ -1157,7 +1249,13 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
         core.loc[proposed, "DecisionStatus"] = "Scenario Analysis"
         core.loc[~proposed, "DecisionStatus"] = "Monitoring"
     if not watch.empty:
-        verified_watch_scope = watch.apply(_samsung_watch_scope, axis=1)
+        # A plausible industry route is a candidate, not a verified Samsung
+        # transaction.  Set Y only for an article-native Samsung case or a
+        # complete entity/product-or-HS/route mapping.
+        verified_watch_scope = watch.apply(
+            lambda r: _direct_samsung_customs_case(r) or _transaction_evidence(r), axis=1
+        )
+        watch["SamsungTradeGateFlag"] = "N"
         watch.loc[verified_watch_scope, "SamsungTradeGateFlag"] = "Y"
         proposed = watch.get("Policy Stage", pd.Series("", index=watch.index)).fillna("").astype(str).str.upper().isin(
             {"PROPOSAL", "PROPOSED", "PROPOSED_OR_MONITORING", "DRAFT", "CONSULTATION", "FORECAST", "ANNOUNCED"}
@@ -1232,8 +1330,7 @@ def validate_final_contract(visible: pd.DataFrame, layers: dict[str, pd.DataFram
         watch_body = watch.apply(lambda r: s(r.get("Body Verified")).upper() == "Y", axis=1)
         watch_scope = watch.apply(
             lambda r: _direct_samsung_customs_case(r)
-            or _samsung_watch_scope(r)
-            or _pending_official_regulation_watch(r),
+            or _samsung_watch_scope(r),
             axis=1,
         )
         bad = watch.loc[~(watch_body & watch_scope)]
@@ -1322,6 +1419,17 @@ def _grounded_narrative(candidate: object, evidence: str, fallback: str) -> str:
     return text if matched / len(tokens) >= 0.34 else fallback
 
 
+def _confirmed_fact_segment(value: object) -> str:
+    """Remove explicitly unverified tails before rendering a fact summary."""
+    text = s(value)
+    if not text:
+        return ""
+    match = re.search(r"\[확인\s*사실\]\s*(.*?)(?=\[미확인\]|$)", text, re.I)
+    if match:
+        return s(match.group(1))
+    return re.split(r"\[미확인\]|미확인\s*사항\s*[:：]", text, maxsplit=1, flags=re.I)[0].strip()
+
+
 def analysis_record(row: pd.Series) -> dict[str, str]:
     # Recalculate presentation status from verifiable fields.  STEP4's
     # EvidenceStatus may label a media-body extraction as SUPPORTED even when
@@ -1330,22 +1438,27 @@ def analysis_record(row: pd.Series) -> dict[str, str]:
     evidence_text = _source_evidence_text(row)
     headline = s(row.get("Headline")) or "정책 신호"
     changed_fallback = f"원문에서 확인된 정책 신호: {headline}"
-    changed = _grounded_narrative(
-        first_known(row, "WhatChanged", "Summary"), evidence_text, changed_fallback
-    )
-    samsung_supported = (
-        _direct_samsung_customs_case(row)
-        or _transaction_evidence(row)
-        or _samsung_watch_scope(row)
-    )
-    if samsung_supported:
+    changed_candidate = _confirmed_fact_segment(first_known(row, "WhatChanged", "Summary"))
+    changed = _grounded_narrative(changed_candidate, evidence_text, changed_fallback)
+    direct_supported = _direct_samsung_customs_case(row) or _transaction_evidence(row)
+    candidate_supported = _samsung_watch_scope(row)
+    if direct_supported:
         impact = _grounded_narrative(
             first_known(row, "SamsungImpactPath", "AI Analysis"),
             evidence_text,
-            "삼성전자 관련 가능성은 확인됐으나 법인·품목·HS·거래경로의 직접 연결은 추가 검증이 필요합니다.",
+            "[확인] 삼성전자 대상 조치 또는 거래 매핑이 확인됐습니다. 세부 적용범위는 원문과 거래자료로 재확인합니다.",
         )
+        impact_level = "CONFIRMED"
+    elif candidate_supported:
+        product = first_known(row, "AffectedProduct", "MappedProduct", default="관련 산업·기술")
+        impact = (
+            f"[합리적 추론] {product} 관련 정책이므로 삼성전자 영향 후보입니다. "
+            "삼성 법인·품목·HS·거래경로의 직접 연결은 아직 확인되지 않았습니다."
+        )
+        impact_level = "INFERENCE"
     else:
-        impact = "삼성전자 법인·품목·HS·거래경로와의 직접 연결은 확인되지 않았습니다."
+        impact = "[미확인] 삼성전자 법인·품목·HS·거래경로와의 직접 연결은 확인되지 않았습니다."
+        impact_level = "UNCONFIRMED"
     if _strict_action_gate(row):
         action = concise(first_known(row, "RecommendedAction", "Action Plan"), 300)
     else:
@@ -1358,6 +1471,7 @@ def analysis_record(row: pd.Series) -> dict[str, str]:
         "stage": first_known(row, "PolicyStageDisplay", "Policy Stage", "PolicyDeltaType"),
         "changed": concise(changed, 330),
         "impact": concise(impact, 360),
+        "impact_level": impact_level,
         "action": action,
         "missing": concise(first_known(row, "VerificationNeeded", "Missing Facts"), 220),
         "official_url": official_link(row),
@@ -1533,11 +1647,11 @@ def write_xlsx_v50(path: Path, visible: pd.DataFrame, layers: dict[str, pd.DataF
             "정책 신호": s(r.get("Headline")), "근거 상태": a["evidence"],
             "무엇이 바뀌었나": a["changed"], "정책 단계": a["stage"],
             "시행·적용일": a["effective"], "대상 품목": a["product"], "HS": a["hs"],
-            "삼성전자 영향": a["impact"], "권고 조치": a["action"],
+            "삼성 영향 근거수준": a["impact_level"], "삼성전자 영향": a["impact"], "권고 조치": a["action"],
             "미확인 사항": a["missing"], "공식 원문": a["official_url"], "근거 기사": s(r.get("URL")),
         })
     brief_columns = ["구분", "원본 게시일", "국가/권역", "정책 신호", "근거 상태", "무엇이 바뀌었나",
-                     "정책 단계", "시행·적용일", "대상 품목", "HS", "삼성전자 영향", "권고 조치",
+                     "정책 단계", "시행·적용일", "대상 품목", "HS", "삼성 영향 근거수준", "삼성전자 영향", "권고 조치",
                      "미확인 사항", "공식 원문", "근거 기사"]
     brief = pd.DataFrame(brief_rows, columns=brief_columns)
     coverage_frames = []
@@ -1591,6 +1705,9 @@ def recipients() -> list[str]:
 
 
 def send_mail(body: str, xlsx: Path, run_date: str) -> None:
+    if os.getenv("GTI_SEND_EMAIL", "true").strip().lower() not in {"true", "1", "yes", "y", "on"}:
+        print("[MAIL SKIP] GTI_SEND_EMAIL disabled")
+        return
     to = recipients()
     if not to: raise RuntimeError("MAIL RECIPIENT MISSING: GTI_MAIL_TO or 00.xlsx")
     if not SMTP_USER or not SMTP_PASS: raise RuntimeError("SMTP CREDENTIAL MISSING")
@@ -1599,8 +1716,28 @@ def send_mail(body: str, xlsx: Path, run_date: str) -> None:
     msg["From"] = formataddr(("GTI Radar", SMTP_USER)); msg["To"] = ", ".join(to)
     msg.set_content("GTI Radar HTML report and XLSX are attached."); msg.add_alternative(body, subtype="html")
     msg.add_attachment(xlsx.read_bytes(), maintype="application", subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=xlsx.name)
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context(), timeout=30) as server:
-        server.login(SMTP_USER, SMTP_PASS); server.send_message(msg)
+    mode = (os.getenv("GTI_SMTP_SECURITY") or "auto").strip().lower()
+    if mode == "auto":
+        if SMTP_PORT == 465:
+            mode = "ssl"
+        elif SMTP_PORT == 587:
+            mode = "starttls"
+        else:
+            raise RuntimeError("SMTP port requires explicit GTI_SMTP_SECURITY=ssl or starttls")
+    context = ssl.create_default_context()
+    if mode == "ssl":
+        connection = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=30)
+    elif mode == "starttls":
+        connection = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    else:
+        raise RuntimeError("GTI_SMTP_SECURITY must be auto, ssl or starttls")
+    with connection as server:
+        if mode == "starttls":
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
     print(f"[MAIL SENT] {len(to)} recipients")
 
 
