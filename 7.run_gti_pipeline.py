@@ -135,7 +135,9 @@ REGULATION_STEPS = [
         name="REG_1_CRAWL",
         script="1.site_crawler.py",
         expected_outputs=("1-1.regulation_raw.xlsx",),
-        timeout_sec=1800,
+        # STEP1 scans many official sites; allow one hour while each
+        # individual site keeps its own short network timeout.
+        timeout_sec=3600,
     ),
     Step(
         name="REG_3_1_SELECT",
