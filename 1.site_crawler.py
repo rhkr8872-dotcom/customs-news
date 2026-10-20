@@ -1149,15 +1149,18 @@ def fetch_korea_html(source_url):
 
     last_error = None
 
-    for attempt in range(1, 4):
+    # GitHub-hosted runners can be slow or blocked by this site. Keep the
+    # failure isolated so one board cannot consume several minutes.
+    for attempt in range(1, 3):
         try:
-            with urlopen(req, timeout=20) as response:
+            with urlopen(req, timeout=12) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
                 html = response.read().decode(charset, errors="replace")
                 return html, params, full_url
         except (ConnectionResetError, TimeoutError, URLError) as e:
             last_error = e
-            time.sleep(attempt * 2)
+            if attempt < 2:
+                time.sleep(attempt)
 
     raise RuntimeError(f"Korea Customs 접속 실패: {last_error}")
 
