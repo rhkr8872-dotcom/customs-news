@@ -222,6 +222,18 @@ jobs:
             Copy-Item $_.FullName -Destination (Join-Path "outputs" $_.Name) -Force
           }
 
+          # STEP5 has a dedicated output directory. Copy its fresh reports
+          # explicitly so bracketed names are never lost by a regex mismatch.
+          $step5OutputDir = "C:\temp\12345\c_type_outputs"
+          if (Test-Path $step5OutputDir) {
+            Get-ChildItem $step5OutputDir -File | Where-Object {
+              $_.LastWriteTime -ge $freshCutoff -and
+              $_.Extension -in @(".xlsx", ".html")
+            } | ForEach-Object {
+              Copy-Item $_.FullName -Destination (Join-Path "outputs" $_.Name) -Force
+            }
+          }
+
           Get-ChildItem "C:\temp" -File -Filter "*.log" |
             Copy-Item -Destination "outputs\logs" -Force
 
