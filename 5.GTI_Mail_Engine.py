@@ -308,7 +308,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v52.5.2 PENDING-REGULATION CONTEXT HOTFIX"
+ENGINE_VERSION = "v52.5.3 SUMMARY-EVIDENCE AND EVENT-IDENTITY HOTFIX"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -345,6 +345,15 @@ def _row_native_text(row: pd.Series) -> str:
 def _canonical_policy_family(row: pd.Series) -> str:
     """Stable event identity across publishers and Korean/English headlines."""
     t = _row_native_text(row)
+    # The same numbered bilateral committee meeting is one event across outlets.
+    # Require both parties and an explicit meeting number; do not merge all FTA news.
+    if re.search(r"한[·ㆍ\s-]*칠레|한국.{0,12}칠레|korea.{0,16}chile|chile.{0,16}korea", t, re.I) and re.search(
+        r"자유무역위원회|free trade commission", t, re.I
+    ):
+        meeting = re.search(r"제\s*(\d+)\s*차|\b(\d+)(?:st|nd|rd|th)\b", t, re.I)
+        if meeting:
+            number = meeting.group(1) or meeting.group(2)
+            return f"KR_CL_FTA_COMMISSION_MEETING_{number}"
     decision_text = " ".join([
         s(row.get("Headline")), s(row.get("Direct Evidence")),
     ]).lower()
@@ -510,7 +519,7 @@ def _context_noise(row: pd.Series) -> bool:
        and not bool(re.search(r"2026년?.{0,40}(?:시행|발효|부과|개정|조사\s*개시|판정)", t, re.I))
     opinion_or_history = bool(re.search(
         r"paul krugman|why does everyone hate|\[칼럼|\[기고|\[사설|오피니언|"
-        r"시각과\s*전망|cptpp.{0,30}무조건\s*가야|관영매체|"
+        r"\[전문가의\s*눈\]|opinion|editorial|시각과\s*전망|cptpp.{0,30}무조건\s*가야|관영매체|"
         r"보호무역주의\s*안돼|촉구|주장|"
         r"1980년대|1990년대|역사적\s*배경|historical background",
         title, re.I,
@@ -520,7 +529,7 @@ def _context_noise(row: pd.Series) -> bool:
     )) and bool(re.search(r"짝퉁|위조상품|단속|적발|원산지", t, re.I))
     employment_support = "tariff support" in t and not current_measure
     non_policy_story = bool(re.search(
-        r"결혼|부고|무역흑자|무역적자|수출\s*급증|수출\s*물류|인터뷰|국감장|"
+        r"trade\s+(?:surplus|deficit)|결혼|부고|무역흑자|무역적자|수출\s*급증|수출\s*물류|인터뷰|국감장|"
         r"현장조사\s*거부|incoming passengers|duty-not-paid cigarettes|여행객|담배",
         title, re.I,
     ))
@@ -1519,16 +1528,16 @@ def health_summary() -> dict[str, int]:
 def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) -> list[str]:
     action, core, watch = layers["action"], layers["core"], layers["watch"]
     context = layers["context"]
-    new_policy_count = len(action) + len(core) + len(context)
-    line1 = f"금일 신규 글로벌 관세·통상 정책 {new_policy_count}건을 확인했습니다."
+    candidate_count = sum(len(frame) for frame in (action, core, watch, context))
+    line1 = f"금일 관세·통상 검토 항목 {candidate_count}건을 보고합니다."
     line2 = (
-        f"삼성전자 거래에 직접 영향을 미치는 확정 정책은 {len(action)}건입니다."
+        f"공식근거와 삼성 거래 연결이 확인된 실행조치는 {len(action)}건이며, 핵심 정책은 {len(core)}건입니다."
         if len(action)
-        else "삼성전자 거래에 직접 영향을 미치는 확정 정책은 없습니다."
+        else f"삼성 거래에 대한 직접 영향이 확인된 실행조치는 0건이며, 공식근거가 확인된 핵심 정책은 {len(core)}건입니다."
     )
     if len(watch):
         headline = concise(watch.iloc[0].get("Headline"), 58)
-        line3 = f"긴급 확인 대상 {len(watch)}건 중 우선 검토사항은 ‘{headline}’입니다."
+        line3 = f"삼성 관련 확인 후보 {len(watch)}건의 공식근거·거래 연결을 검토해야 합니다. 우선 확인: ‘{headline}’."
     elif len(core):
         headline = concise(core.iloc[0].get("Headline"), 58)
         line3 = f"공식근거가 확인된 핵심 정책 {len(core)}건 중 우선 검토사항은 ‘{headline}’입니다."
@@ -1817,3 +1826,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
